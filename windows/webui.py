@@ -255,7 +255,9 @@ button:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
       <div class="top"><span class="nm">Focus</span><span class="hint" id="fhint">auto</span>
         <span class="val" id="fval">Auto</span></div>
       <input type="range" id="focus" min="0" max="1" step="0.01" value="0">
-      <div class="ticks"><span>auto</span><span>near</span><span>far</span></div>
+      <!-- FOCUSDIST v sets v * minimum-focus diopters: just right of auto is far, the right end is
+           the closest the lens goes. The old "auto / near / far" ticks had it backwards. -->
+      <div class="ticks"><span>auto &middot; far</span><span>near</span></div>
       <div class="why"><button class="mini" id="rfbtn">Refocus once</button></div>
     </div>
     <div class="hr"></div>
@@ -529,10 +531,16 @@ async function poll(){
     if(szMode==='auto'){
       $('szbar').style.display='';
       $('szfill').style.width=Math.min(100,Math.max(0,(s.sz_obs-1)/1.4*100))+'%';
+      /* Auto only ever zooms IN while Auto-frame drives it; on the manual slider it just hands back
+         (SensorZoom.update, `tracking`). The readout has to say so or it promises a takeover. */
       let t = s.sz_obs>1.03
-        ? 'Auto · phone at <b>'+s.sz_obs.toFixed(2)+'×</b> — the PC crop was pinned and you were still small in frame.'
-        : 'Auto · phone at <b>1.00×</b> — PC crop <b>'+s.z.toFixed(2)+'×</b> of <b>'
-          +s.zmax.toFixed(2)+'×</b> max. The phone takes over only when the PC crop runs out.';
+        ? (s.auto
+            ? 'Auto · phone at <b>'+s.sz_obs.toFixed(2)+'×</b> — the PC crop was pinned and you were still small in frame.'
+            : 'Auto · phone held at <b>'+s.sz_obs.toFixed(2)+'×</b>. Auto-frame is off, so it only hands back — zoom out to release it.')
+        : (s.auto
+            ? 'Auto · phone at <b>1.00×</b> — PC crop <b>'+s.z.toFixed(2)+'×</b> of <b>'
+              +s.zmax.toFixed(2)+'×</b> max. The phone takes over only when the PC crop runs out.'
+            : 'Auto · phone at <b>1.00×</b>. It zooms in only while Auto-frame is tracking.');
       if(Math.abs(s.sz_req-s.sz_obs)>0.05)
         t+=' <span style="color:var(--warn)">→ '+s.sz_req.toFixed(2)+'× landing</span>';
       $('szline').innerHTML=t;

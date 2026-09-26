@@ -250,6 +250,32 @@ sz7.update(af4.z_want if af4.enabled else 1.0, 1000.52)
 check("a far face reaches the sensor in auto mode", bool(sent6) and sent6[0] > 1.0,
       f"enabled={af4.enabled} z_want={af4.z_want:.2f} sent={sent6}")
 
+# ---- 9. the manual slider must never make sensor "auto" zoom in ---------------------------------
+# REGRESSION 2026-09-26: with Auto-frame off, _send_loop hands SensorZoom the manual slider as z_want.
+# The slider lives in the frame the phone sends and never reacts to the sensor, so the remainder
+# formula ratcheted: slider 3.0 sent ZOOM 1.5, then 2.25, and the output sat at 6.75x, not 3.0x.
+sent7 = []
+sz8 = op3t.SensorZoom(sent7.append)
+sz8.mode = "auto"
+t = 2000.0
+for _ in range(6):
+    sz8.update(3.0, t, tracking=False)
+    sz8.observe(4648, round(4648 / sz8.req))        # the phone applies whatever was asked
+    t += op3t.AF_SENSOR_DWELL + 0.1
+check("manual zoom never engages sensor 'auto'", sent7 == [] and 3.0 * sz8.obs == 3.0,
+      f"sent={sent7} out={3.0 * sz8.obs:.2f}x")
+
+# ...but it still hands back what auto-framing left engaged: holding at the hand-back point means
+# turning Auto-frame off never jumps, and zooming out returns the full field of view.
+sent8 = []
+sz9 = op3t.SensorZoom(sent8.append)
+sz9.mode, sz9.req = "auto", 1.8
+sz9.observe(4648, round(4648 / 1.8))
+sz9.update(2.0, 3000.0, tracking=False)            # Auto-frame handed back at the pinned crop
+check("manual hand-back holds the sensor", sent8 == [], f"sent={sent8}")
+sz9.update(1.0, 3010.0, tracking=False)            # user zooms all the way out
+check("manual zoom-out releases the sensor", sent8 == [op3t.AF_SENSOR_MIN], f"sent={sent8}")
+
 print()
 if fails:
     print(f"{len(fails)} FAILED: {', '.join(fails)}")
