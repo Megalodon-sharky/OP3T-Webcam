@@ -1,0 +1,18 @@
+# Android
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
+*.iml
+*.apk
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# PyInstaller
+windows/build/
+windows/dist/
+*.spec

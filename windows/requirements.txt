@@ -1,0 +1,6 @@
+pyvirtualcam
+numpy
+# Optional but recommended. Used for ONE thing: cv2.resize on the crop path, which is MEASURED 5-8x
+# faster than the numpy fallback (1.18 ms vs 9.47 ms at 1080p, z=1.2) and now runs on every frame
+# while auto-framing is engaged. The import is guarded, so the app still runs without it.
+opencv-python-headless

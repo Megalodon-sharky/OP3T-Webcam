@@ -1,0 +1,57 @@
+OP3T Webcam — latency baseline
+Read and updated by the /reprobe skill. Free text; nothing parses this file.
+
+================================================================================
+2026-07-28  1080p60, idle box, phone ONEPLUS_A3003
+Command:
+    python windows/latency_probe.py --seconds 16 --flush-packets --extra "-fpsprobesize 0"
+ffmpeg argv actually used:
+    -flags low_delay -probesize 262144 -c:v h264_qsv -async_depth 1 -extra_hw_frames 2
+    -fpsprobesize 0 -i pipe:0 -fps_mode passthrough -flush_packets 1 -pix_fmt nv12
+    -f rawvideo pipe:1
+
+  access units:  909  (60.2 fps over 15.1 s)      <- phone cadence, target 60
+  first byte -> first decoded frame:  1146 ms     <- QSV/MFX session init, one-time per Start
+  DECODE+PIPE steady state:  mean 41.34  median 40.06  p95 48.14  max 331.30 ms
+  per-second median (ms):  131 114 40 41 41 39 40 40 40 40 40 40 39 40 40 42
+  ffmpeg CPU: 4.39 s over 16 s wall = 27% of one core
+
+End-to-end check through the real Pipeline + pyvirtualcam (not the probe):
+  60 fps sustained for 16 s, 1 dropped frame total, device "OBS Virtual Camera".
+
+Interpretation: the per-second timeline is FLAT after warm-up, so the ~40 ms is a fixed
+offset, not a queue filling. Roughly 16.7 ms of it is the H.264 parser (the phone emits no
+AUD NALs, so a frame cannot be closed until the next one starts); the rest is QSV decode
+plus the pipe hand-off.
+
+Alternatives measured the same day, same box:
+  CPU     (-f h264 -threads 1)        26-42 ms   53% core   52 ms to first frame
+  cuvid   (h264_cuvid)                59-62 ms   23% core   ~330 ms to first frame
+  QSV without -extra_hw_frames 2      78 ms      30% core   ~1.3 s to first frame
+  cuvid + -surfaces 4                 no change (59.9 vs 59.1 ms)
+
+NOT yet in this baseline: photons -> socket on the phone. Needs the millisecond-timer
+glass-to-glass test; subtract the decode+pipe median above to isolate it.
+================================================================================
+
+================================================================================
+2026-08-02  after: wide stdout pipe, webui poll trim, 4K-capture-at-30, focus slider
+Command:
+    python windows/latency_probe.py --seconds 16 --flush-packets
+
+  DECODE+PIPE steady state:  mean 22.40  median 21.66  p95 27.16  max 323.42 ms
+  per-second median (ms):  39 22 22 23 24 22 22 21 21 21 22 22 21 21 21 23
+  first byte -> first decoded frame:  790 ms
+  ffmpeg CPU: 3.66 s over 16 s = 23% of one core
+
+Down from 40.06 ms median on 2026-07-28, and the profile is flat from second 2.
+CAVEAT: latency_probe.py spawns its OWN ffmpeg with plain subprocess.PIPE, so this run
+does NOT exercise the app's new wide stdout pipe (_spawn_ffmpeg) — that is only on the
+Pipeline path. Run-to-run spread on this box is large (QSV has read 78, 40 and 21.7 ms on
+different days), so treat any single run as indicative, not decisive.
+
+App path verified separately through the real Pipeline + pyvirtualcam:
+  1080p@30 -> phone logs "Streaming at 1920x1080 @30 (capture 3840x2160)", 30.0 fps steady
+  1080p@60 -> phone logs "Streaming at 1920x1080 @60 (capture 1920x1080)", 60.2 fps steady
+  drops in both cases occur only during the camera warm-up, then stop.
+================================================================================

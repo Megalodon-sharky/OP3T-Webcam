@@ -1,0 +1,43 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.op3t.webcam'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId "com.op3t.webcam"
+        minSdk 28          // Android 9 (OnePlus 3T)
+        targetSdk 28       // keep behavior simple on the 3T; no scoped-storage churn
+        versionCode 1
+        versionName "1.0"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+}
+
+// Force one Kotlin stdlib version. A transitive dep drags in kotlin-stdlib-jdk7/jdk8 1.6.0,
+// which clashes with stdlib 1.8.22 (the jdk7/jdk8 classes were merged into the main jar at 1.8).
+// Pinning all three to 1.8.22 makes jdk7/jdk8 empty redirect stubs -> no duplicate classes.
+configurations.all {
+    resolutionStrategy {
+        force 'org.jetbrains.kotlin:kotlin-stdlib:1.8.22'
+        force 'org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.8.22'
+        force 'org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.8.22'
+    }
+}
+
+dependencies {
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'androidx.core:core:1.12.0'
+}
