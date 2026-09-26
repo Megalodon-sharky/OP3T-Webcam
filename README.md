@@ -61,7 +61,11 @@ The control panel is [pywebview](https://pywebview.flowrl.com) on the Microsoft 
 
 ### 1. Install the Android app
 
-With the phone plugged in:
+**Prebuilt:** download `OP3T-Webcam.apk` from
+[Releases](https://github.com/Megalodon-sharky/OP3T-Webcam/releases/latest) and run
+`adb install OP3T-Webcam.apk`, or copy it to the phone and open it there.
+
+**From source**, with the phone plugged in:
 
 ```powershell
 cd android
@@ -76,9 +80,11 @@ The first launch asks for camera permission on the phone. Tap **Allow**.
 
 ### 2. Get the Windows app
 
-**Portable exe:** run `windows\build_exe.bat`. It installs PyInstaller and the Python dependencies,
-bundles the ffmpeg and adb it finds on your PATH, and writes a single-file
-`windows\dist\OP3T Webcam.exe` (~155 MB). OBS is the only thing the exe still needs.
+**Portable exe:** download `OP3T-Webcam.exe` from
+[Releases](https://github.com/Megalodon-sharky/OP3T-Webcam/releases/latest). It bundles ffmpeg and
+adb, so OBS is the only thing it still needs. To build it yourself, run `windows\build_exe.bat`: it
+installs PyInstaller and the Python dependencies, bundles the ffmpeg and adb it finds on your PATH,
+and writes a single-file `windows\dist\OP3T Webcam.exe` (~155 MB).
 
 **From source:** install the requirements above, then double-click `windows\OP3T Webcam.vbs` (no
 console window) or run `windows\start_webcam.bat` (with a console, for debugging).
@@ -261,3 +267,10 @@ docs/                           auto-framing PRD and implementation plan
 - The H.264 encoder handles 4K at 30 fps; a 4K readout cannot sustain 60 fps.
 - Camera HAL: maximum digital zoom 4.0×, `croppingType` is `CENTER_ONLY` (a sensor crop cannot pan),
   and face detection is `SIMPLE` only (up to 10 faces, no landmarks or IDs).
+
+## License
+
+[MIT](LICENSE) for the code in this repository. The release exe also bundles third-party software
+under its own licenses: FFmpeg (GPL-3.0, [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) build), adb
+from Android SDK Platform-Tools (Apache-2.0), pyvirtualcam (GPL-2.0), OpenCV (Apache-2.0), numpy
+(BSD-3-Clause), pywebview (BSD-3-Clause), and pythonnet and bottle (MIT).
