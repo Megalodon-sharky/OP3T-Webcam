@@ -902,10 +902,17 @@ class SensorZoom:
         if arr_w > 0 and crop_w > 0:
             self.obs = min(max(arr_w / crop_w, 1.0), 8.0)
 
-    def update(self, z_want, now):
+    def update(self, z_want, now, tracking=True):
         """z_want: what the zoom law asked for BEFORE the AF_ZOOM_MAX clamp, in the current
         (already sensor-cropped) frame. > AF_ZOOM_MAX means the PC crop is pinned and the subject is
-        still too small; well under it means there is slack to hand back."""
+        still too small; well under it means there is slack to hand back.
+
+        tracking: False when z_want is the MANUAL slider, not the auto-framer. "auto" then only ever
+        hands magnification BACK. The slider lives in the frame the phone sends but never reacts to
+        the sensor, so the remainder formula ratchets on it: slider 3.0 sent ZOOM 1.5, then 2.25, and
+        the output sat at 6.75x (see test_autoframe.py). Holding rather than parking also keeps the
+        hand-back from Auto-frame free of any jump; zooming out below the release threshold still
+        returns the full field of view."""
         if self.mode == "off":
             # Park at the floor rather than 1.0 — see AF_SENSOR_MIN. Turning the feature off must not
             # arm the 6.2 s stall for whenever it is turned back on. If it was never used at all
@@ -917,6 +924,8 @@ class SensorZoom:
             # One formula for both directions; the two thresholds ARE the hysteresis, so a subject
             # sitting between them never makes the phone re-issue anything.
             want = min(max(self.obs * z_want / AF_ZOOM_MAX, AF_SENSOR_MIN), AF_SENSOR_MAX)
+            if not tracking:
+                want = min(want, self.req)      # release only; see `tracking` above
         else:
             want = self.req
         band = AF_SENSOR_STEP if self.mode == "auto" else 0.01
@@ -1332,17 +1341,18 @@ class Pipeline:
                     # could come from different updates. Passing the full frame through when not
                     # zoomed keeps the zero-cost path exactly as it was.
                     tnow = time.monotonic()
-                    if self.af.enabled:
+                    tracking = self.af.enabled   # read ONCE: the UI thread can disengage mid-frame
+                    if tracking:
                         view = self.af.step(tnow)
                         z_want = self.af.z_want
                     else:
                         p = self.pan
                         view = (self.zoom, p[0], p[1])
-                        z_want = self.zoom       # manual: the slider IS the demand
+                        z_want = self.zoom       # manual: the slider is the demand, but see SensorZoom.update
                     # Phone-side zoom decision. Cheap (a compare and a clock read on most frames) and
                     # it deliberately runs on THIS thread, so the ratio it picks is the one belonging
                     # to the frame being sent. It returns nothing: see SensorZoom, it moves no pixels.
-                    self.sz.update(z_want, tnow)
+                    self.sz.update(z_want, tnow, tracking)
                     self.auto_view = view            # both previews draw THIS, never their own copy
                     z, cx, cy = view
                     out = full if z <= 1.001 else _crop_scale(full, w, h, z, cx, cy)
