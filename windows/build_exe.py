@@ -49,6 +49,8 @@ def adb_files():
 def main():
     subprocess.run([sys.executable, "-m", "pip", "install", "--quiet",
                     "pyinstaller", "pyvirtualcam", "numpy",
+                    # the web control panel; --copy-metadata pywebview below fails without it
+                    "pywebview",
                     # headless build: no Qt/GTK. Only used for cv2.resize on the crop path, which is
                     # MEASURED 5-8x faster than the numpy fallback and now runs on every frame while
                     # auto-framing is engaged.
