@@ -2,9 +2,9 @@
 """Self-checks for auto-start: the AutoCam timing and the VcamHost camera hand-off.
 Run: python windows/test_autocam.py   (exits 1 on failure)
 
-No framework, no phone and no real camera needed: AutoCam is pure logic fed a count and a clock, and
-VcamHost runs against a fake pyvirtualcam. The one real-Windows check (counting handles on the OBS
-section) only runs when something is producing the virtual camera right now, and is read-only.
+No framework and no phone needed: AutoCam is pure logic fed a count and a clock, and VcamHost runs
+against a fake camera. The one real-Windows check counts handles on a real OBS section made by
+obs_vcam.py, so it needs OBS Studio installed and nothing else producing the virtual camera.
 """
 import sys
 import time
@@ -78,7 +78,7 @@ check("disabled: never starts", acts == [], f"{acts}")
 class FakeCam:
     made = []
 
-    def __init__(self, width, height, fps, fmt=None):
+    def __init__(self, width, height, fps):
         self.spec, self.sent, self.closed, self.device = (width, height, fps), 0, False, "fake"
         FakeCam.made.append(self)
 
@@ -91,9 +91,9 @@ class FakeCam:
 
 
 users = {"n": 0}
-real_helpers = (m.pyvirtualcam.Camera, m._section_open, m._section_close, m._own_handles,
+real_helpers = (m.ObsVirtualCamera, m._section_open, m._section_close, m._own_handles,
                 m._section_handles, m.VCAM_IDLE_FPS)
-m.pyvirtualcam.Camera = FakeCam
+m.ObsVirtualCamera = FakeCam
 m._section_open = lambda name=m.VCAM_SECTION: 123
 m._section_close = lambda h: None
 m._own_handles = lambda h: 2
@@ -134,20 +134,36 @@ try:
           host.cam is None and cam3.closed)
     host.close()
 finally:
-    (m.pyvirtualcam.Camera, m._section_open, m._section_close, m._own_handles,
+    (m.ObsVirtualCamera, m._section_open, m._section_close, m._own_handles,
      m._section_handles, m.VCAM_IDLE_FPS) = real_helpers
 
-# ---- 4. the real handle counter (read-only; only if something is producing right now) ---------------
-probe = m._section_open()
-if not probe:
-    print("SKIP  nothing is producing the OBS virtual camera right now — handle count not checked")
+# ---- 4. the real handle counter, on a real section ---------------------------------------------------
+import obs_vcam                                         # noqa: E402
+
+if not obs_vcam.installed():
+    print("SKIP  OBS Studio is not installed — handle count not checked")
+elif m._section_open():
+    print("SKIP  something else is producing the OBS virtual camera — handle count not checked")
 else:
+    host = m.VcamHost()
     try:
-        total, own = m._section_handles(probe), m._own_handles(probe)
-        check("NtQueryObject sees the producer's handle and ours", total >= 2, f"total={total}")
-        check("this process holds exactly the probe", own == 1, f"own={own}")
+        host.idle(64, 36, 30)
+        deadline = time.monotonic() + 3.0
+        while host.cam is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        check("VcamHost made a real camera", host.cam is not None, host.error)
+        if host.cam is not None:
+            own = m._own_handles(host._probe)
+            check("we hold exactly two handles: the writer's and the probe", own == 2, f"own={own}")
+            check("NtQueryObject counts them system-wide",
+                  m._section_handles(host._probe) >= 2, f"total={m._section_handles(host._probe)}")
+            check("...so with no app capturing, consumers() is 0", host.consumers() == 0,
+                  f"{host.consumers()} (an app with the camera on right now also counts)")
     finally:
-        m._section_close(probe)
+        host.close()
+    probe = m._section_open()
+    check("close() removes the section", probe is None)
+    m._section_close(probe)
 
 print()
 if fails:

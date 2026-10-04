@@ -48,7 +48,7 @@ def adb_files():
 
 def main():
     subprocess.run([sys.executable, "-m", "pip", "install", "--quiet",
-                    "pyinstaller", "pyvirtualcam", "numpy",
+                    "pyinstaller", "numpy",
                     # the web control panel; --copy-metadata pywebview below fails without it
                     "pywebview",
                     # headless build: no Qt/GTK. Only used for cv2.resize on the crop path, which is
@@ -70,7 +70,10 @@ def main():
         print("WARNING: adb not found — exe will need adb on PATH")
 
     cmd = [sys.executable, "-m", "PyInstaller", "--onefile", "--noconsole",
-           "--name", "OP3T Webcam", "--collect-all", "pyvirtualcam",
+           "--name", "OP3T Webcam",
+           # Belt and braces: pyvirtualcam (GPL-2.0-only) is no longer imported anywhere — obs_vcam.py
+           # replaced it — but a copy left installed on the build box must never ride along.
+           "--exclude-module", "pyvirtualcam",
            # liquid-glass web UI (pywebview + WebView2). clr_loader/pythonnet = its Windows backend.
            "--collect-all", "webview", "--collect-all", "clr_loader",
            "--copy-metadata", "pywebview", "--hidden-import", "webui",

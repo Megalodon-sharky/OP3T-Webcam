@@ -8,7 +8,7 @@ Pipeline (all heavy lifting is reused; this file is wiring + UI):
       -> raw H.264 Annex-B bytes
       -> ffmpeg decodes (GPU or CPU), passthrough timing, applies orientation
       -> a reader thread keeps only the NEWEST decoded frame (drops stale ones)
-      -> pyvirtualcam pushes that frame into the OBS Virtual Camera
+      -> obs_vcam writes that frame into the OBS Virtual Camera
       -> any app (Discord/Zoom/Teams/OBS) sees "OBS Virtual Camera"
 
 Why the reader drops frames: if the PC is briefly busy, decoded frames must NOT
@@ -19,7 +19,7 @@ Live control travels back up the same socket:
   "ZOOM <ratio> <cx> <cy>", "FOCUS", "NR <0|1>" (phone-side noise reduction).
 
 Prereqs (install once): adb, ffmpeg, OBS Studio (vcam backend),
-  pip install pyvirtualcam numpy   (tkinter ships with Python)
+  pip install -r requirements.txt   (tkinter ships with Python)
 
 Run:
   pythonw op3t_webcam.py           # GUI (no console). Or double-click "OP3T Webcam.vbs".
@@ -38,7 +38,8 @@ import threading
 import time
 
 import numpy as np
-import pyvirtualcam
+
+from obs_vcam import ObsVirtualCamera
 
 # Optional. GUARDED because latency_probe.py imports this module and must keep working on a machine
 # without OpenCV — and because the numpy path below is a correct fallback, not a stub.
@@ -967,14 +968,14 @@ class SensorZoom:
 # ---------------------------------------------------------------- virtual camera host + auto-start
 
 # The OBS Virtual Camera is a DirectShow filter that every capturing app loads into its own process.
-# It reads frames from a named section created by the producer (pyvirtualcam, here), and it holds a
+# It reads frames from a named section created by the producer (obs_vcam.py), and it holds a
 # handle to that section ONLY while the app is actually capturing. MEASURED 2026-10-04 (Windows 11
 # 25H2, OBS 32.1.2, sampled every 10 ms, ffmpeg as the consumer with Discord live alongside it):
 #   device enumeration (-list_devices)   never opens it
 #   format query (-list_options)         never opens it
 #   a capture                            opened 0.24 s after launch, closed the instant it exited
 #   Discord with its camera on           exactly one handle, from its capture process
-#   pyvirtualcam producing               exactly one handle
+#   the producer                         exactly one handle (pyvirtualcam then; obs_vcam.py too)
 # Nothing else works: the queue header carries no reader state (read_idx is written by the WRITER),
 # and Windows' camera-privacy records never list virtual-camera use. So the section's system-wide
 # handle count, minus our own, is the number of apps that have the camera on.
@@ -1011,8 +1012,8 @@ def _win32():
 
 def _section_open(name=VCAM_SECTION):
     """A handle to the named section, or None if nothing produces it. Holding this keeps the section
-    alive, so it must be closed before the camera is re-created (pyvirtualcam refuses to create one
-    that still exists)."""
+    alive, so it must be closed before the camera is re-created (ObsVirtualCamera refuses to create
+    one that still exists)."""
     try:
         return _win32()[0].OpenFileMappingW(0x0004, False, name) or None    # FILE_MAP_READ
     except Exception:
@@ -1035,8 +1036,8 @@ def _section_handles(h):
 
 def _own_handles(h):
     """How many handles THIS process holds to the object behind `h`, `h` included. Counted, not
-    assumed: a pyvirtualcam that kept one more handle would otherwise read as an app with the camera
-    on, and wake the phone for nobody. None if Windows will not say."""
+    assumed: a producer that kept one more handle would otherwise read as an app with the camera on,
+    and wake the phone for nobody. None if Windows will not say."""
     import ctypes
     from ctypes import wintypes as w
     try:
@@ -1074,7 +1075,7 @@ def _section_close(h):
 
 
 class VcamHost:
-    """Owns the one pyvirtualcam.Camera for the whole run, so the virtual camera can exist BEFORE any
+    """Owns the one ObsVirtualCamera for the whole run, so the virtual camera can exist BEFORE any
     stream does — the only way to notice an app turning it on (see VCAM_SECTION).
 
     Between streams it feeds black frames at VCAM_IDLE_FPS. A Pipeline borrows the SAME camera for its
@@ -1163,13 +1164,12 @@ class VcamHost:
     def _open(self, w, h, fps, wait=3.0):
         """(Re)create the camera; caller holds _lock. A camera that is going away lingers until every
         app that mapped it lets go — the filter does that within a frame of seeing it stop — and
-        pyvirtualcam refuses to create one while it lingers, hence the short retry."""
+        ObsVirtualCamera refuses to create one while it lingers, hence the short retry."""
         self._close()
         deadline = time.monotonic() + wait
         while True:
             try:
-                self.cam = pyvirtualcam.Camera(width=w, height=h, fps=fps,
-                                               fmt=pyvirtualcam.PixelFormat.NV12)
+                self.cam = ObsVirtualCamera(w, h, fps)
                 break
             except Exception as e:
                 if time.monotonic() >= deadline:
@@ -1182,7 +1182,7 @@ class VcamHost:
         self.spec, self._black, self.error = (w, h, fps), black, ""
         self._probe = _section_open()
         own = _own_handles(self._probe) if self._probe else None
-        self.own = own if own else 2   # MEASURED fallback: pyvirtualcam's one + the probe
+        self.own = own if own else 2   # MEASURED fallback: the writer's one + the probe
         return True
 
     def _close(self):
@@ -1645,7 +1645,7 @@ class Pipeline:
             # The web UI keeps the camera alive across sessions (VcamHost) so auto-start can see an
             # app turn it on; headless and the tkinter panel still own one per session.
             vcam = (self.vcam.session(w, h, fps) if self.vcam is not None else
-                    pyvirtualcam.Camera(width=w, height=h, fps=fps, fmt=pyvirtualcam.PixelFormat.NV12))
+                    ObsVirtualCamera(w, h, fps))
             with vcam as cam:
                 self.state, self.msg = "streaming", cam.device
                 t0, c0 = time.monotonic(), 0
@@ -2200,17 +2200,18 @@ def run_gui(host, port):
 
 def run_test(w, h, fps):
     print(f"TEST MODE: {w}x{h}@{fps} moving pattern -> OBS Virtual Camera. Ctrl+C to stop.")
-    with pyvirtualcam.Camera(width=w, height=h, fps=fps, fmt=pyvirtualcam.PixelFormat.BGR) as cam:
+    with ObsVirtualCamera(w, h, fps) as cam:
         print(f"virtual camera live: {cam.device}  (pick this in Discord)")
-        frame = np.zeros((h, w, 3), np.uint8)
+        frame = np.empty((h * 3 // 2, w), np.uint8)       # NV12: Y plane, then interleaved U/V
         x = np.arange(w, dtype=np.int32)
-        i = 0
+        i, due = 0, time.perf_counter()
         while True:
-            frame[:, :, 0] = ((x + i) % 256).astype(np.uint8)
-            frame[:, :, 1] = ((x + i * 2) % 256).astype(np.uint8)
-            frame[:, :, 2] = ((x - i) % 256).astype(np.uint8)
+            frame[:h] = ((x + i) % 220 + 16).astype(np.uint8)              # moving luma ramp
+            frame[h:, 0::2] = ((x[0::2] + i * 2) % 224 + 16).astype(np.uint8)   # U
+            frame[h:, 1::2] = ((x[1::2] - i) % 224 + 16).astype(np.uint8)       # V
             cam.send(frame)
-            cam.sleep_until_next_frame()
+            due += 1.0 / fps
+            time.sleep(max(0.0, due - time.perf_counter()))
             i += 3
 
 

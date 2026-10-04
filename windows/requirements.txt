@@ -1,4 +1,3 @@
-pyvirtualcam
 numpy
 # The control panel (pywebview on the Edge WebView2 runtime). Without it the app falls back to tkinter.
 pywebview

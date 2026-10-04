@@ -29,7 +29,7 @@ flowchart LR
         ff["ffmpeg decode → NV12<br/>QSV · NVIDIA · D3D11VA · CPU"] --> rd["keep newest frame, drop stale"]
         rd --> crop["crop box: zoom · pan"]
         af["auto-framer"] --> crop
-        crop --> vcam["pyvirtualcam → OBS Virtual Camera"]
+        crop --> vcam["obs_vcam.py → OBS Virtual Camera"]
     end
     phone -->|"tcp:8080 · H.264 video<br/>(control lines flow back)<br/>tcp:8081 · face boxes<br/>adb forward over USB"| pc
 ```
@@ -272,6 +272,7 @@ python windows\test_autoframe.py   # auto-framing maths: isotropic face mapping,
 python windows\test_webui.py       # every api.* call in the panel exists, every element id it touches exists
 python windows\test_panel.py       # runs the panel's real JavaScript in Node against a stub DOM (skips without Node)
 python windows\test_autocam.py     # auto-start timing and the virtual-camera hand-off, against a fake camera
+python windows\test_obs_vcam.py    # the virtual-camera writer: memory layout, then a round trip through OBS's own filter
 python windows\latency_probe.py    # per-stage latency; close the app first, the phone serves one client at a time
 ```
 
@@ -295,6 +296,7 @@ android/                        Android app (Java, minSdk 28)
 windows/
   op3t_webcam.py                receiver: adb, ffmpeg pipeline, auto-framing, tkinter fallback, CLI
   webui.py                      pywebview control panel
+  obs_vcam.py                   OBS Virtual Camera writer (the shared memory OBS's filter reads)
   build_exe.py, build_exe.bat   PyInstaller single-file build with ffmpeg + adb bundled
   latency_probe.py              per-stage latency measurement
   latency_baseline.txt          recorded measurements
@@ -315,5 +317,9 @@ docs/                           auto-framing PRD and implementation plan
 
 [MIT](LICENSE) for the code in this repository. The release exe also bundles third-party software
 under its own licenses: FFmpeg (GPL-3.0, [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) build), adb
-from Android SDK Platform-Tools (Apache-2.0), pyvirtualcam (GPL-2.0), OpenCV (Apache-2.0), numpy
-(BSD-3-Clause), pywebview (BSD-3-Clause), and pythonnet and bottle (MIT).
+from Android SDK Platform-Tools (Apache-2.0), OpenCV (Apache-2.0), numpy (BSD-3-Clause), pywebview
+(BSD-3-Clause), and pythonnet and bottle (MIT). FFmpeg and adb run as separate programs.
+
+The virtual-camera writer, [`windows/obs_vcam.py`](windows/obs_vcam.py), is this project's own code. The
+v1.0.0 exe used pyvirtualcam (GPL-2.0-only) for that part, which does not combine with OpenCV's
+Apache-2.0 license; v1.1.0 and later ship without it.
