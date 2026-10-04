@@ -238,6 +238,16 @@ def _ensure_online():
         _adb("reconnect", "offline")
 
 
+def adb_warm():
+    """Start the adb server now, touching no phone. MEASURED 2026-10-05: a cold server start costs
+    5.1 s on the dev box (with or without ADB_MDNS), and auto-start used to pay it the first time an
+    app turned the camera on after launch, before the phone could even be woken: 9 s of black."""
+    try:
+        _adb("start-server")
+    except Exception:
+        pass
+
+
 def adb_forward(port):
     """USB tunnel + wake the phone + open the app — no .bat/console, no touching the phone."""
     try:
@@ -2344,7 +2354,7 @@ def main():
                "RESOLUTIONS": RESOLUTIONS, "FPS_OPTS": FPS_OPTS, "ROTATIONS": ROTATIONS,
                "DECODERS": DECODERS,
                "load_config": load_config, "save_config": save_config, "adb_forward": adb_forward,
-               "shutdown_phone": shutdown_phone, "park_phone": park_phone,
+               "shutdown_phone": shutdown_phone, "park_phone": park_phone, "adb_warm": adb_warm,
                "start_mjpeg": start_mjpeg, "log_js_error": log_js_error,
                "VcamHost": VcamHost, "AutoCam": AutoCam, "tray": args.tray, "show_event": show_event,
                "get_autostart": get_autostart, "set_autostart": set_autostart,

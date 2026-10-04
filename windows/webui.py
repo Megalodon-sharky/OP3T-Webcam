@@ -736,6 +736,9 @@ class Api:
         self._win = win
         if "VcamHost" not in self.ctx:
             return
+        if self.cfg.get("autocam", True) and "adb_warm" in self.ctx:
+            # so the first camera-on after launch does not wait 5 s for an adb server to start
+            threading.Thread(target=self.ctx["adb_warm"], daemon=True).start()
         self.vcam = self.ctx["VcamHost"]()
         self.pipe.vcam = self.vcam
         if self.cfg.get("autocam", True):
