@@ -10,7 +10,8 @@ it into **OBS Virtual Camera**, so it works anywhere a webcam does: Zoom, Discor
 - **Low latency**: ~22 ms median decode + pipe at 1080p60 ([measured](windows/latency_baseline.txt)). The newest frame always wins, so nothing queues.
 - **Auto-frame**: face-tracking zoom and pan, driven by the phone ISP's own face detector
 - **Live controls**: zoom/pan crop box, sensor zoom, exposure, manual focus, torch, bitrate, orientation, mirror/flip, low-light mode
-- **Hands-off**: the PC app wakes the phone and opens the camera app over adb; closing it puts the phone back to sleep
+- **Starts by itself**: turn the camera on in Discord, Zoom or anything else and the phone wakes and streams within ~5 s; turn it off and the phone goes back to sleep
+- **Lives in the tray**: opens maximised, closes to the tray, and can start with Windows
 - **OLED saver**: the phone screen goes black after 30 s of streaming (tap to wake)
 
 ## How it works
@@ -93,15 +94,38 @@ console window) or run `windows\start_webcam.bat` (with a console, for debugging
 
 1. Plug the phone in over USB and accept the *Allow USB debugging* prompt. `adb devices` should list
    it as `device`. Keep only one Android device attached.
-2. Start **OP3T Webcam** on the PC. It forwards the ports, wakes the phone and opens the phone app for
-   you. A swipe lock screen is dismissed automatically; with a PIN or pattern, unlock the phone.
-3. Click **Start**.
-4. In your meeting app, pick **OBS Virtual Camera**.
+2. Start **OP3T Webcam** on the PC. It opens maximised and puts an icon in the tray.
+3. In your meeting app, pick **OBS Virtual Camera** and turn the camera on. The phone wakes, opens its
+   camera app and streams within about 5 seconds. Turn the camera off and about 10 seconds later the
+   phone goes back to sleep. A swipe lock screen is dismissed for you; with a PIN or pattern, unlock
+   the phone first.
 
-**Stop** ends the stream but leaves the phone ready for the next Start. **Closing the window** also
-closes the phone app, puts its screen to sleep and shuts down the adb server.
+**Start** and **Stop** still work by hand. A stream you started yourself is never stopped for you,
+and a Stop is respected until the meeting app lets go of the camera.
+
+**The tray icon** shows the state (grey waiting, blue connecting, green streaming). Left-click opens
+the window; right-click has Start/Stop, the two startup switches and **Quit**. The close button only
+hides the window: the app has to keep running to notice an app turning the camera on. Tick **Start
+with Windows** and it is always waiting, without ever showing a window. Launching it again just
+brings the running copy forward. **Quit** closes the phone app, puts its screen to sleep and shuts
+down the adb server.
 
 Settings persist in `%APPDATA%\OP3T Webcam\config.json`.
+
+### How auto-start notices the camera
+
+The OBS Virtual Camera is a DirectShow filter that each capturing app loads into its own process. It
+reads frames from a shared-memory section that the producer (this app) creates, and it holds a handle
+to that section **only while the app is actually capturing**. Measured with ffmpeg as the capturing
+app and Discord alongside it: listing devices or formats never opens it, a capture opens it within
+0.25 s and closes it the instant it stops, and Discord's capture process held exactly one handle
+while its camera was on. So while it waits, OP3T Webcam keeps the virtual camera alive with black
+frames (10 fps, about 1% of a core) and counts handles on the section, four times a second. The
+stream then takes over the same camera, so the app that turned it on never sees it drop. An app must
+hold the camera for 0.5 s before the phone is woken.
+
+The catch: while auto-start is on, this app holds the OBS Virtual Camera, so **OBS Studio's own
+virtual camera cannot start**. Untick auto-start (or quit from the tray) when you need OBS's.
 
 ## Controls
 
@@ -123,6 +147,8 @@ mid-call tweaks; **Setup** is collapsed because you set it once. Only the two co
 | **Quality** | Setup | Encoder bitrate: 8, 12 (default), 16 or 20 Mbps. |
 | **Mirror / Flip** | Setup | Horizontal mirror and vertical flip, on the phone GPU. |
 | **Noise reduction** | Setup | Low-light mode: high-quality ISP noise reduction, and auto-exposure may drop to ~7 fps for longer, cleaner exposures. |
+| **Start when an app turns the camera on** | Setup, tray | Auto-start (on by default). Off brings back the old behaviour: only Start starts the stream, and the virtual camera exists only while streaming. |
+| **Start with Windows** | Setup, tray | Adds a per-user login entry (no admin) that starts the app hidden in the tray. |
 | **Preview** | — | 640×360 at 30 fps: the full frame with the crop box drawn on it. Drag to pan, scroll or drag the corner to zoom, double-click to reset. Off by default. |
 
 The status bar shows the stream state, fps, frame count and dropped frames.
@@ -146,6 +172,7 @@ python windows\op3t_webcam.py --headless --decoder CPU
 | `--sensor-zoom-x` | `1.0` | fixed ratio for `--sensor-zoom on`, 1.0–2.4 |
 | `--width` / `--height` | `1920` / `1080` | the phone picks the largest size its encoder supports within this |
 | `--host` / `--port` | `127.0.0.1` / `8080` | |
+| `--tray` | off | start the GUI hidden in the tray (what Start with Windows runs) |
 
 ## Protocol
 
@@ -222,6 +249,21 @@ logged once a second: `adb logcat -s CameraStreamer`.
   off to pin the frame rate.
 - **The panel opens but its controls do nothing**: check `%APPDATA%\OP3T Webcam\js_error.log`, where
   the web panel records its own errors.
+- **Turning the camera on does nothing**: the app must be running (tray icon present; tick **Start
+  with Windows** so it always is), and **Start when an app turns the camera on** must be ticked. A
+  phone with a PIN or pattern lock has to be unlocked.
+- **OBS Studio says its virtual camera is in use**: OP3T Webcam holds it while auto-start waits. Untick
+  auto-start or quit from the tray.
+- **Windows Firewall asked about `adb.exe` on every launch** (before this version): the exe unpacks adb
+  into a new temp folder each time, and adb's wireless-debugging discovery listened on the network,
+  so Windows asked again for every new path. The app now starts adb with `ADB_MDNS=0`, which opens
+  nothing but `127.0.0.1`, so there is nothing to ask about. To delete the rules the old prompts left
+  behind (one per launch), run this in an **administrator** PowerShell. It matches only those temp
+  copies, not a real adb install:
+
+  ```powershell
+  Get-NetFirewallApplicationFilter | Where-Object Program -like '*\_MEI*\tools\adb.exe' | Get-NetFirewallRule | Remove-NetFirewallRule
+  ```
 
 ## Development
 
@@ -229,6 +271,7 @@ logged once a second: `adb logcat -s CameraStreamer`.
 python windows\test_autoframe.py   # auto-framing maths: isotropic face mapping, frame-rate-independent smoothing
 python windows\test_webui.py       # every api.* call in the panel exists, every element id it touches exists
 python windows\test_panel.py       # runs the panel's real JavaScript in Node against a stub DOM (skips without Node)
+python windows\test_autocam.py     # auto-start timing and the virtual-camera hand-off, against a fake camera
 python windows\latency_probe.py    # per-stage latency; close the app first, the phone serves one client at a time
 ```
 

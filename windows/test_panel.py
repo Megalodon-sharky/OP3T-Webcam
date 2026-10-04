@@ -109,7 +109,11 @@ for (const name of API_METHODS) {
 // THE BRIDGE ARRIVES LATE, ON PURPOSE. pywebview took NINE SECONDS to inject its api on the dev
 // machine (measured 2026-08-28); a bootstrap that gives up after 1 s leaves every control unwired
 // and reports nothing. 2.5 s here is far longer than the old 1 s window and short enough to test.
-realSetTimeout(() => { global.window.pywebview = { api: apiStub }; }, 2500);
+// ...AND IT ARRIVES EMPTY FIRST, like the real thing: pywebview's api.js creates `pywebview.api` as {}
+// and finish.js fills it in one go later (_createApi). A bootstrap that boots on the empty object
+// throws "api.options is not a function" and never retries (MEASURED 2026-10-05 under a busy start).
+realSetTimeout(() => { global.window.pywebview = { api: {} }; }, 1000);
+realSetTimeout(() => { Object.assign(global.window.pywebview.api, apiStub); }, 2500);
 
 // ---- run the panel --------------------------------------------------------------------------
 __SCRIPT__

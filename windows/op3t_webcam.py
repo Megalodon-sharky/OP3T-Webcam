@@ -27,6 +27,7 @@ Run:
   python  op3t_webcam.py --headless --width 1280 --height 720 --fps 60
 """
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -152,6 +153,8 @@ DEFAULTS = {
     "sensor_zoom_x": 1.0,     # the fixed ratio used by mode "on"
     "tightness": 1.5,         # auto-framing: how much of the frame your face fills. Persisted apart
                               # from `zoom` because the UI slider means one or the other, never both.
+    "autocam": True,          # start/stop the stream when an app turns the virtual camera on/off
+                              # (see VcamHost). Off = the old behaviour: only Start starts it.
 }
 SENSOR_MODES = ("off", "auto", "on")
 
@@ -250,20 +253,13 @@ def adb_forward(port):
         pass
 
 
-def shutdown_phone(port):
-    """Run when the PC app CLOSES — deliberately NOT on Stop, so pressing Stop still leaves the phone
-    ready for another Start.
+def park_phone(port):
+    """Close the phone app and put the screen to sleep, so the phone isn't left awake with a warm
+    camera after you're done. KEYCODE_SLEEP (not POWER) because POWER *toggles* — on an already dark
+    screen it would switch the display back ON. Sleep locks the phone when a secure lock screen is set.
 
-    Two jobs:
-    1. Close the phone app and put the screen to sleep, so the phone isn't left awake with a warm
-       camera after you're done. KEYCODE_SLEEP (not POWER) because POWER *toggles* — on an already
-       dark screen it would switch the display back ON. Sleep locks the phone when a secure lock
-       screen is set.
-    2. Kill the adb server. This is the fix for "Failed to remove temporary directory _MEIxxxxx":
-       the bundled adb.exe starts a background adb *server* that keeps running after the app exits,
-       holding tools\\adb.EXE open inside PyInstaller's unpack dir, so the cleanup can't delete it.
-       Killing the server releases that handle. adb restarts itself on demand next launch.
-    """
+    Leaves the adb server running: this is also what runs when an app turns the camera off while the
+    PC app stays in the tray, and the next start should not pay for an adb cold start."""
     try:
         _adb("shell", "am", "force-stop", APP_ID)
         _adb("shell", "input", "keyevent", "KEYCODE_SLEEP")
@@ -274,6 +270,18 @@ def shutdown_phone(port):
         _adb("forward", "--remove", f"tcp:{FACE_PORT}")   # or stale forwards pile up across runs
     except Exception:
         pass
+
+
+def shutdown_phone(port):
+    """Run when the PC app QUITS — deliberately NOT on Stop, so pressing Stop still leaves the phone
+    ready for another Start.
+
+    park_phone(), then kill the adb server. That is the fix for "Failed to remove temporary directory
+    _MEIxxxxx": the bundled adb.exe starts a background adb *server* that keeps running after the app
+    exits, holding tools\\adb.EXE open inside PyInstaller's unpack dir, so the cleanup can't delete it.
+    Killing the server releases that handle. adb restarts itself on demand next launch.
+    """
+    park_phone(port)
     try:
         _adb("kill-server")      # must be LAST: everything above needs the server alive
     except Exception:
@@ -946,6 +954,293 @@ class SensorZoom:
                 pass          # the phone link is best-effort; never take the video path down with it
 
 
+# ---------------------------------------------------------------- virtual camera host + auto-start
+
+# The OBS Virtual Camera is a DirectShow filter that every capturing app loads into its own process.
+# It reads frames from a named section created by the producer (pyvirtualcam, here), and it holds a
+# handle to that section ONLY while the app is actually capturing. MEASURED 2026-10-04 (Windows 11
+# 25H2, OBS 32.1.2, sampled every 10 ms, ffmpeg as the consumer with Discord live alongside it):
+#   device enumeration (-list_devices)   never opens it
+#   format query (-list_options)         never opens it
+#   a capture                            opened 0.24 s after launch, closed the instant it exited
+#   Discord with its camera on           exactly one handle, from its capture process
+#   pyvirtualcam producing               exactly one handle
+# Nothing else works: the queue header carries no reader state (read_idx is written by the WRITER),
+# and Windows' camera-privacy records never list virtual-camera use. So the section's system-wide
+# handle count, minus our own, is the number of apps that have the camera on.
+VCAM_SECTION = "OBSVirtualCamVideo"
+VCAM_IDLE_FPS = 10      # black frames while waiting: plenty to keep the filter attached, ~1% of a core
+AUTOCAM_ON_S = 0.5      # an app must hold the camera this long before the phone is woken
+AUTOCAM_OFF_S = 10.0    # ...and be gone this long before a stream it caused winds down
+AUTOCAM_RETRY_S = 5.0   # a stream that died while an app still wants it is retried this often
+
+_win32_cache = []
+
+
+def _win32():
+    """(kernel32, ntdll, kernelbase) with the few signatures used below, built on first use."""
+    if not _win32_cache:
+        import ctypes
+        from ctypes import wintypes as w
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenFileMappingW.restype = w.HANDLE
+        k32.OpenFileMappingW.argtypes = [w.DWORD, w.BOOL, w.LPCWSTR]
+        k32.CloseHandle.argtypes = [w.HANDLE]
+        nt = ctypes.WinDLL("ntdll")
+        nt.NtQueryObject.restype = ctypes.c_long
+        nt.NtQueryObject.argtypes = [w.HANDLE, ctypes.c_int, ctypes.c_void_p, w.ULONG, ctypes.c_void_p]
+        nt.NtQueryInformationProcess.restype = ctypes.c_long
+        nt.NtQueryInformationProcess.argtypes = [w.HANDLE, ctypes.c_int, ctypes.c_void_p, w.ULONG,
+                                                 ctypes.POINTER(w.ULONG)]
+        kb = ctypes.WinDLL("kernelbase")
+        kb.CompareObjectHandles.restype = w.BOOL
+        kb.CompareObjectHandles.argtypes = [w.HANDLE, w.HANDLE]
+        _win32_cache[:] = [k32, nt, kb]
+    return _win32_cache
+
+
+def _section_open(name=VCAM_SECTION):
+    """A handle to the named section, or None if nothing produces it. Holding this keeps the section
+    alive, so it must be closed before the camera is re-created (pyvirtualcam refuses to create one
+    that still exists)."""
+    try:
+        return _win32()[0].OpenFileMappingW(0x0004, False, name) or None    # FILE_MAP_READ
+    except Exception:
+        return None
+
+
+def _section_handles(h):
+    """System-wide handle count of the object behind `h` (NtQueryObject, ObjectBasicInformation).
+    Kernel object addresses are hidden from user mode on 24H2+, so this count is the cheap way to see
+    other processes' handles: no enumeration of every handle on the box."""
+    import ctypes
+    try:
+        buf = ctypes.create_string_buffer(56)       # OBJECT_BASIC_INFORMATION: exactly 56 bytes on x64,
+        if _win32()[1].NtQueryObject(h, 0, buf, 56, None):     # any other length is a mismatch
+            return 0
+        return int.from_bytes(buf.raw[8:12], "little")        # .HandleCount
+    except Exception:
+        return 0
+
+
+def _own_handles(h):
+    """How many handles THIS process holds to the object behind `h`, `h` included. Counted, not
+    assumed: a pyvirtualcam that kept one more handle would otherwise read as an app with the camera
+    on, and wake the phone for nobody. None if Windows will not say."""
+    import ctypes
+    from ctypes import wintypes as w
+    try:
+        _, nt, kb = _win32()
+        size = 1 << 16
+        while True:
+            buf = ctypes.create_string_buffer(size)
+            ret = w.ULONG()
+            st = nt.NtQueryInformationProcess(w.HANDLE(-1), 51, buf, size, ctypes.byref(ret))
+            st &= 0xFFFFFFFF                          # 51 = ProcessHandleInformation
+            if st == 0xC0000004 and size < (1 << 24):     # STATUS_INFO_LENGTH_MISMATCH
+                size = max(size * 2, ret.value + 4096)
+                continue
+            if st:
+                return None
+            break
+        raw = buf.raw
+        n = int.from_bytes(raw[:8], "little")
+        same = 0
+        for i in range(n):                           # PROCESS_HANDLE_TABLE_ENTRY_INFO: 40 bytes each
+            hv = int.from_bytes(raw[16 + 40 * i:24 + 40 * i], "little")
+            if hv == h or kb.CompareObjectHandles(hv, h):
+                same += 1
+        return same
+    except Exception:
+        return None
+
+
+def _section_close(h):
+    if h:
+        try:
+            _win32()[0].CloseHandle(h)
+        except Exception:
+            pass
+
+
+class VcamHost:
+    """Owns the one pyvirtualcam.Camera for the whole run, so the virtual camera can exist BEFORE any
+    stream does — the only way to notice an app turning it on (see VCAM_SECTION).
+
+    Between streams it feeds black frames at VCAM_IDLE_FPS. A Pipeline borrows the SAME camera for its
+    session (session()) and hands it back after, so an app that turned the camera on early never sees
+    it vanish and come back; only a new frame rate re-creates it. With idling off the camera lives
+    exactly as long as a session, as it did before this class existed."""
+
+    _serializable = False     # keep pywebview's js_api crawler out (see webui.Tray)
+
+    def __init__(self):
+        self.cam = None
+        self.spec = None          # (w, h, fps) of self.cam
+        self.error = ""
+        self.own = 2              # our handles to the section; re-counted on every _open
+        self._want = None         # spec to keep alive between streams; None = no idle camera
+        self._busy = False        # a Pipeline is sending; idle frames stand aside
+        self._probe = None
+        self._black = None
+        self._lock = threading.Lock()   # one send() at a time across the idle loop and a takeover
+        self._quit = threading.Event()
+        self._thread = None
+        self._retry_at = 0.0
+
+    def idle(self, w, h, fps):
+        """Keep a camera alive between streams (auto-start on). Cheap to call again."""
+        self._want = (w, h, fps)
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._idle_loop, daemon=True)
+            self._thread.start()
+
+    def no_idle(self):
+        """Back to a camera only while streaming (auto-start off)."""
+        self._want = None
+        with self._lock:
+            if not self._busy:
+                self._close()
+
+    def consumers(self):
+        """How many apps have the virtual camera on right now; 0 while no camera exists."""
+        p = self._probe
+        n = _section_handles(p) if p else 0
+        return max(0, n - self.own) if n else 0
+
+    @contextlib.contextmanager
+    def session(self, w, h, fps):
+        """The Pipeline's camera for one session: the idle one when the spec matches, else a new one."""
+        with self._lock:
+            if self.cam is None or self.spec != (w, h, fps):
+                if not self._open(w, h, fps):
+                    raise RuntimeError(self.error)
+            if self._want is not None:
+                self._want = (w, h, fps)    # idle at what was streamed last, or the next idle re-creates
+            self._busy = True
+            cam = self.cam
+        try:
+            yield cam
+        finally:
+            with self._lock:
+                self._busy = False
+                if self._want is None:
+                    self._close()
+
+    def close(self):
+        self._quit.set()
+        with self._lock:
+            self._close()
+
+    def _idle_loop(self):
+        while not self._quit.wait(1.0 / VCAM_IDLE_FPS):
+            with self._lock:
+                if self._busy or self._want is None:
+                    continue
+                if self.cam is None or self.spec != self._want:
+                    # Something else may own the camera (OBS's own, or another copy of this app):
+                    # ask again every few seconds, not every frame.
+                    if time.monotonic() < self._retry_at:
+                        continue
+                    if not self._open(*self._want, wait=0.0):
+                        self._retry_at = time.monotonic() + 5.0
+                        continue
+                try:
+                    self.cam.send(self._black)
+                except Exception as e:
+                    self.error = str(e)
+
+    def _open(self, w, h, fps, wait=3.0):
+        """(Re)create the camera; caller holds _lock. A camera that is going away lingers until every
+        app that mapped it lets go — the filter does that within a frame of seeing it stop — and
+        pyvirtualcam refuses to create one while it lingers, hence the short retry."""
+        self._close()
+        deadline = time.monotonic() + wait
+        while True:
+            try:
+                self.cam = pyvirtualcam.Camera(width=w, height=h, fps=fps,
+                                               fmt=pyvirtualcam.PixelFormat.NV12)
+                break
+            except Exception as e:
+                if time.monotonic() >= deadline:
+                    self.error = f"virtual camera unavailable ({e})"
+                    return False
+                time.sleep(0.1)
+        black = np.empty((h * 3 // 2, w), np.uint8)
+        black[:h] = 16            # NV12 video-range black: Y=16, U=V=128
+        black[h:] = 128
+        self.spec, self._black, self.error = (w, h, fps), black, ""
+        self._probe = _section_open()
+        own = _own_handles(self._probe) if self._probe else None
+        self.own = own if own else 2   # MEASURED fallback: pyvirtualcam's one + the probe
+        return True
+
+    def _close(self):
+        _section_close(self._probe)        # first: our own handle would keep the section alive
+        self._probe = None
+        if self.cam is not None:
+            try:
+                self.cam.close()
+            except Exception:
+                pass
+        self.cam = self.spec = None
+
+
+class AutoCam:
+    """When to start and stop the stream, from how many apps have the camera on. Pure logic — fed a
+    count and a clock — so the timing is testable without a camera or a phone.
+
+    - An app must hold the camera AUTOCAM_ON_S before the phone is woken.
+    - Only a stream THIS started is ever stopped by it (a manual Start belongs to the user), and only
+      after every app has been gone AUTOCAM_OFF_S, so flicking the camera during a call does not
+      bounce the phone.
+    - A manual Stop while an app still has the camera on is respected until that app lets go.
+    - A stream that died under an app that still wants it (phone unplugged, say) is retried every
+      AUTOCAM_RETRY_S."""
+
+    _serializable = False     # keep pywebview's js_api crawler out (see webui.Tray)
+
+    def __init__(self, on_s=AUTOCAM_ON_S, off_s=AUTOCAM_OFF_S, retry_s=AUTOCAM_RETRY_S):
+        self.enabled = True
+        self.on_s, self.off_s, self.retry_s = on_s, off_s, retry_s
+        self.active = False       # debounced: some app has the camera on
+        self.owns = False         # the running stream was started here
+        self.held = False         # the user stopped it while an app still had the camera on
+        self._edge = None         # when the raw count last crossed zero, not yet debounced
+        self._last_start = -1e9
+
+    def step(self, users, now, streaming):
+        """users: apps with the camera on. streaming: a session is running or connecting.
+        Returns "start", "stop" or None."""
+        present = users > 0
+        if present == self.active:
+            self._edge = None
+        else:
+            if self._edge is None:
+                self._edge = now
+            if now - self._edge >= (self.on_s if present else self.off_s):
+                self.active, self._edge = present, None
+                if not present:
+                    self.held = False
+        if not self.enabled:
+            return None
+        if (self.active and not streaming and not self.held
+                and now - self._last_start >= self.retry_s):
+            self.owns, self._last_start = True, now
+            return "start"
+        if not self.active and streaming and self.owns:
+            self.owns = False
+            return "stop"
+        return None
+
+    def user_start(self):
+        self.owns = False
+
+    def user_stop(self):
+        self.owns = False
+        self.held = self.active
+
+
 def _spawn_ffmpeg(cmd, frame_bytes):
     """Start ffmpeg with an stdout pipe big enough to hold a whole frame. Returns (proc, read_stream).
 
@@ -992,6 +1287,7 @@ class Pipeline:
         self.bitrate = 12        # live quality in Mbps; re-sent after each (re)connect
         self.flip_h = False      # phone-side GPU flips; re-sent after each (re)connect
         self.flip_v = False
+        self.vcam = None          # VcamHost when the web UI runs one; None = own camera per session
         self.preview_on = False
         # Auto-framing. `af` owns the smoothed view; `auto_view` is the (z, cx, cy) actually applied
         # to the last frame, which is what BOTH previews must draw so the crop box cannot lie.
@@ -1111,40 +1407,35 @@ class Pipeline:
 
     def _run(self, host, port, w, h, fps, rot, decoder, flip_h=False, flip_v=False):
         sock = None
-        attempt = 0
-        while not self._stop and sock is None:
+        kick = 0.0                    # when to next run adb_forward (wake, launch, forward) while waiting
+        while not self._stop:
             try:
                 sock = socket.create_connection((host, port), timeout=2)
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                self._sock = sock     # set first, so stop() can break a handshake that is waiting
+                self._send_config(sock, w, h, fps, rot, flip_h, flip_v)
+                # adb forward ACCEPTS on the PC even when nothing listens on the phone yet, then drops
+                # the connection once it cannot reach the device: a session that "connects" and is
+                # over at once. MEASURED 2026-10-05: forward set, phone app not running -> connect OK,
+                # then EOF. Auto-start launches the phone app just before this, so a connection only
+                # counts once video arrives.
+                if self._phone_answered(sock):
+                    break
+                raise OSError("dropped before any video")
             except OSError:
+                if sock is not None:
+                    try: sock.close()
+                    except OSError: pass
+                sock = self._sock = None
                 self.msg = "waiting for phone (open the app, plug in USB)"
-                attempt += 1
-                if attempt % 3 == 0:           # link likely went 'offline' — self-heal + re-launch app
+                # First miss: the phone app is probably just not running (auto-start parks it between
+                # calls, and launching no longer wakes it) — wake, launch, forward right away. Then
+                # every 4 s, for a link that went 'offline': self-heal + re-launch.
+                if time.monotonic() >= kick:
                     adb_forward(port)
-                time.sleep(1)
+                    kick = time.monotonic() + 4.0
+                time.sleep(0.5)
         if self._stop or sock is None:
-            return
-        self._sock = sock
-
-        try:
-            sock.sendall(f"{w}x{h}@{fps}\n".encode())
-            # No ZOOM to the phone — it streams the full frame; zoom/pan is the PC-side crop box.
-            sock.sendall(f"NR {1 if self.denoise else 0}\n".encode())
-            sock.sendall(f"EV {self.ev}\n".encode())
-            sock.sendall(f"BITRATE {self.bitrate}\n".encode())
-            if self.focus > 0:
-                sock.sendall(f"FOCUSDIST {self.focus:.3f}\n".encode())   # 0 = leave it on autofocus
-            if self.torch:
-                sock.sendall(f"FLASH 1\n".encode())
-            sock.sendall(f"XFORM {rot} {1 if flip_h else 0} {1 if flip_v else 0}\n".encode())
-            # the face mapping needs the SAME transform the phone is applying
-            self.rot, self.flip_h, self.flip_v = rot, flip_h, flip_v
-            # A fresh session always starts at sensor zoom 1.0. Clearing this is what stops a
-            # reconnect from believing a ratio it requested before the phone restarted.
-            self.sz.req = self.sz.obs = 1.0
-            self.sz.t_change = -1e9
-        except OSError:
-            self.state, self.msg = "error", "could not send config to phone"
             return
 
         # PC does ZERO image processing. Rotation, flips and denoise all happen on the phone GPU/ISP;
@@ -1218,6 +1509,41 @@ class Pipeline:
                 return self._run(host, port, w, h, fps, rot, "CPU", flip_h, flip_v)
 
         self._send_loop(w, h, fps)
+
+    def _send_config(self, sock, w, h, fps, rot, flip_h, flip_v):
+        sock.sendall(f"{w}x{h}@{fps}\n".encode())
+        # No ZOOM to the phone — it streams the full frame; zoom/pan is the PC-side crop box.
+        sock.sendall(f"NR {1 if self.denoise else 0}\n".encode())
+        sock.sendall(f"EV {self.ev}\n".encode())
+        sock.sendall(f"BITRATE {self.bitrate}\n".encode())
+        if self.focus > 0:
+            sock.sendall(f"FOCUSDIST {self.focus:.3f}\n".encode())   # 0 = leave it on autofocus
+        if self.torch:
+            sock.sendall(f"FLASH 1\n".encode())
+        sock.sendall(f"XFORM {rot} {1 if flip_h else 0} {1 if flip_v else 0}\n".encode())
+        # the face mapping needs the SAME transform the phone is applying
+        self.rot, self.flip_h, self.flip_v = rot, flip_h, flip_v
+        # A fresh session always starts at sensor zoom 1.0. Clearing this is what stops a
+        # reconnect from believing a ratio it requested before the phone restarted.
+        self.sz.req = self.sz.obs = 1.0
+        self.sz.t_change = -1e9
+
+    def _phone_answered(self, sock, wait=8.0):
+        """True once the phone has sent its first byte of video, False if the connection was dropped
+        first (adb forward's fake accept, see _run). Peeked, so _pump still reads that byte. A phone
+        silent for `wait` seconds gets the benefit of the doubt: the decoder watchdog and the reader
+        take it from there, as they always did."""
+        deadline = time.monotonic() + wait
+        sock.settimeout(0.25)
+        try:
+            while not self._stop and time.monotonic() < deadline:
+                try:
+                    return sock.recv(1, socket.MSG_PEEK) != b""
+                except socket.timeout:
+                    pass
+            return not self._stop
+        finally:
+            sock.settimeout(2)        # what create_connection set; _pump's recv still relies on it
 
     def _reader(self, ffout, frame_bytes):
         """Decode->display decoupler. Reads complete frames as fast as ffmpeg emits them and keeps
@@ -1306,8 +1632,11 @@ class Pipeline:
         face_thread = threading.Thread(target=self._face_loop, args=("127.0.0.1",), daemon=True)
         face_thread.start()
         try:
-            with pyvirtualcam.Camera(width=w, height=h, fps=fps,
-                                     fmt=pyvirtualcam.PixelFormat.NV12) as cam:
+            # The web UI keeps the camera alive across sessions (VcamHost) so auto-start can see an
+            # app turn it on; headless and the tkinter panel still own one per session.
+            vcam = (self.vcam.session(w, h, fps) if self.vcam is not None else
+                    pyvirtualcam.Camera(width=w, height=h, fps=fps, fmt=pyvirtualcam.PixelFormat.NV12))
+            with vcam as cam:
                 self.state, self.msg = "streaming", cam.device
                 t0, c0 = time.monotonic(), 0
                 while not self._stop:
@@ -1913,6 +2242,72 @@ def _raise_own_priority():
         pass
 
 
+# ---------------------------------------------------------------- start with Windows / one instance
+
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+RUN_VALUE = "OP3T Webcam"
+
+
+def autostart_command():
+    """What Windows runs at login: this exe, or this script under pythonw, straight into the tray."""
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}" --tray'
+    pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    return f'"{pyw if os.path.exists(pyw) else sys.executable}" "{os.path.abspath(__file__)}" --tray'
+
+
+def get_autostart(key=RUN_KEY):
+    """The login entry as stored, or "" when there is none."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key) as k:
+            return str(winreg.QueryValueEx(k, RUN_VALUE)[0] or "")
+    except OSError:
+        return ""
+
+
+def set_autostart(on, key=RUN_KEY):
+    """Add or remove the per-user login entry (HKCU, so no admin prompt). Returns the new state."""
+    import winreg
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, key) as k:
+        if on:
+            winreg.SetValueEx(k, RUN_VALUE, 0, winreg.REG_SZ, autostart_command())
+        else:
+            try:
+                winreg.DeleteValue(k, RUN_VALUE)
+            except FileNotFoundError:
+                pass
+    return bool(get_autostart(key))
+
+
+def _single_instance(show_existing):
+    """Claim the one-copy-per-user slot. Returns this copy's "show yourself" event handle, None when
+    another copy already runs (which is then asked to show its window, unless show_existing is False:
+    a login launch must not pop anything open), or 0 when Windows would not say — run anyway.
+
+    One copy matters now that the app lives in the tray: two would fight over the one virtual camera,
+    and double-clicking the exe should bring the running one forward, not start a second."""
+    try:
+        import ctypes
+        from ctypes import wintypes as w
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateMutexW.restype = k32.CreateEventW.restype = w.HANDLE
+        k32.CreateMutexW.argtypes = [ctypes.c_void_p, w.BOOL, w.LPCWSTR]
+        k32.CreateEventW.argtypes = [ctypes.c_void_p, w.BOOL, w.BOOL, w.LPCWSTR]
+        k32.SetEvent.argtypes = [w.HANDLE]
+        mutex = k32.CreateMutexW(None, False, "Local\\OP3TWebcam.Instance")
+        first = ctypes.get_last_error() != 183              # ERROR_ALREADY_EXISTS
+        show = k32.CreateEventW(None, False, False, "Local\\OP3TWebcam.Show")    # auto-reset
+        if not first:
+            if show_existing and show:
+                k32.SetEvent(show)
+            return None
+        _single_instance.held = mutex                      # owned for the life of the process
+        return show or 0
+    except Exception:
+        return 0
+
+
 def main():
     _raise_own_priority()
     ap = argparse.ArgumentParser()
@@ -1931,6 +2326,8 @@ def main():
                          "crop is pinned, on = fixed phone ratio (--sensor-zoom-x)")
     ap.add_argument("--sensor-zoom-x", type=float, default=1.0,
                     help=f"fixed sensor ratio for --sensor-zoom on (1.0..{AF_SENSOR_MAX})")
+    ap.add_argument("--tray", action="store_true",
+                    help="start hidden in the notification area (what Start with Windows runs)")
     args = ap.parse_args()
 
     if args.test:
@@ -1939,13 +2336,19 @@ def main():
         run_headless(args.host, args.port, args.width, args.height, args.fps, args.rotation,
                      args.decoder, args.autoframe, args.sensor_zoom, args.sensor_zoom_x)
     else:
+        show_event = _single_instance(show_existing=not args.tray)
+        if show_event is None:
+            return                     # the running copy was asked to show itself
         # Liquid-glass web UI (pywebview). Falls back to the tkinter GUI if it's unavailable.
         ctx = {"host": args.host, "port": args.port, "Pipeline": Pipeline,
                "RESOLUTIONS": RESOLUTIONS, "FPS_OPTS": FPS_OPTS, "ROTATIONS": ROTATIONS,
                "DECODERS": DECODERS,
                "load_config": load_config, "save_config": save_config, "adb_forward": adb_forward,
-               "shutdown_phone": shutdown_phone, "start_mjpeg": start_mjpeg,
-               "log_js_error": log_js_error}
+               "shutdown_phone": shutdown_phone, "park_phone": park_phone,
+               "start_mjpeg": start_mjpeg, "log_js_error": log_js_error,
+               "VcamHost": VcamHost, "AutoCam": AutoCam, "tray": args.tray, "show_event": show_event,
+               "get_autostart": get_autostart, "set_autostart": set_autostart,
+               "autostart_command": autostart_command}
         try:
             import webui
             log_js_error("webui.run: entering")
