@@ -22,7 +22,9 @@ Before this every one of those was the same rounded pill and you had to click on
 
 import base64
 import struct
+import sys
 import threading
+import time
 
 import numpy as np
 
@@ -255,7 +257,9 @@ button:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
       <div class="top"><span class="nm">Focus</span><span class="hint" id="fhint">auto</span>
         <span class="val" id="fval">Auto</span></div>
       <input type="range" id="focus" min="0" max="1" step="0.01" value="0">
-      <div class="ticks"><span>auto</span><span>near</span><span>far</span></div>
+      <!-- FOCUSDIST v sets v * minimum-focus diopters: just right of auto is far, the right end is
+           the closest the lens goes. The old "auto / near / far" ticks had it backwards. -->
+      <div class="ticks"><span>auto &middot; far</span><span>near</span></div>
       <div class="why"><button class="mini" id="rfbtn">Refocus once</button></div>
     </div>
     <div class="hr"></div>
@@ -281,6 +285,11 @@ button:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
       <label class="cb"><input type="checkbox" id="dn"><span class="box"></span>Noise reduction
         <span style="color:var(--sub)">&nbsp;(on the phone)</span></label>
       <div class="note" id="capnote"></div>
+      <div class="hr" style="margin:11px 0"></div>
+      <label class="cb"><input type="checkbox" id="ac"><span class="box"></span>Start when an app turns
+        the camera on</label>
+      <label class="cb"><input type="checkbox" id="sw"><span class="box"></span>Start with Windows, in
+        the tray</label>
     </div>
   </details>
 
@@ -308,6 +317,7 @@ button:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
 <script>
 const $=i=>document.getElementById(i);
 let api=null, running=false, afOn=false, szMode='off', PV=null, pvOn=false, booted=false;
+let acT=0, swT=0;   /* last local click on the two startup switches: poll() must not undo it mid-call */
 let RES='1920x1080';
 
 /* ---- bridge hygiene -------------------------------------------------------------------------
@@ -374,6 +384,7 @@ async function bootInner(){
   capNote();
 
   $('fh').checked=!!c.flip_h; $('fv').checked=!!c.flip_v; $('dn').checked=!!c.denoise;
+  $('ac').checked=c.autocam!==false; $('sw').checked=!!o.autostart;
   store.zoom=Number(c.zoom)||1; store.tight=Number(c.tightness)||1.5;
   setAf(!!c.autoframe);
   view.z=store.zoom; view.cx=(c.pan&&c.pan[0])||0.5; view.cy=(c.pan&&c.pan[1])||0.5;
@@ -413,6 +424,9 @@ async function bootInner(){
   $('fh').onchange=()=>{ setXform(); saveSoon(); };
   $('fv').onchange=()=>{ setXform(); saveSoon(); };
   $('dn').onchange=()=>{ api.set_denoise($('dn').checked); saveSoon(); };
+  $('ac').onchange=()=>{ acT=Date.now(); api.set_autocam($('ac').checked); saveSoon(); };
+  $('sw').onchange=async()=>{ swT=Date.now(); const on=await api.set_autostart($('sw').checked);
+    if(typeof on==='boolean') $('sw').checked=on; };   /* the registry has the last word */
   $('go').onclick=toggle; $('pvbtn').onclick=togglePreview;
 
   /* crop box: scroll = zoom, drag box = pan, drag corner = zoom, dbl-click = reset */
@@ -445,7 +459,7 @@ function snap(){ return {resolution:RES,fps:$('fps').value,rotation:$('rot').val
   flip_h:$('fh').checked,flip_v:$('fv').checked,denoise:$('dn').checked,
   zoom:store.zoom,tightness:store.tight,ev:Number($('ev').value),bitrate:Number($('bitrate').value),
   focus:Number($('focus').value),autoframe:afOn,sensor_zoom:szMode,
-  sensor_zoom_x:Number($('szx').value)}; }
+  sensor_zoom_x:Number($('szx').value),autocam:$('ac').checked}; }
 function setXform(){ api.set_transform($('rot').value,$('fh').checked,$('fv').checked); }
 function restartChange(){ if(api) api.save(snap()); if(running) api.restart(snap()); }
 
@@ -512,8 +526,17 @@ async function poll(){
   try{
     const s=await api.status();
     $('st').className='statusbar '+s.state; $('ststr').textContent=s.state;
-    $('meta').textContent = s.state==='streaming'
+    let meta = s.state==='streaming'
       ? s.fps.toFixed(1)+' fps · '+s.frames+' frames · '+s.dropped+' dropped' : s.msg;
+    if(s.state==='idle' && !meta && s.autocam)
+      meta = s.cam_users ? 'an app turned the camera on — starting' : 'starts when an app turns the camera on';
+    $('meta').textContent = meta;
+    /* The stream now starts and stops without this button (auto-start, the tray menu), so the
+       button follows the truth instead of its own memory of the last click. */
+    if(typeof s.running==='boolean' && s.running!==running){ running=s.running;
+      $('go').textContent=running?'Stop':'Start'; $('go').classList.toggle('run',running); }
+    if(typeof s.autocam==='boolean' && Date.now()-acT>1500) $('ac').checked=s.autocam;
+    if(typeof s.autostart==='boolean' && Date.now()-swT>1500) $('sw').checked=s.autostart;
 
     /* the crop box must draw the APPLIED view or it lies about where the output points */
     if(s.auto){
@@ -529,10 +552,16 @@ async function poll(){
     if(szMode==='auto'){
       $('szbar').style.display='';
       $('szfill').style.width=Math.min(100,Math.max(0,(s.sz_obs-1)/1.4*100))+'%';
+      /* Auto only ever zooms IN while Auto-frame drives it; on the manual slider it just hands back
+         (SensorZoom.update, `tracking`). The readout has to say so or it promises a takeover. */
       let t = s.sz_obs>1.03
-        ? 'Auto · phone at <b>'+s.sz_obs.toFixed(2)+'×</b> — the PC crop was pinned and you were still small in frame.'
-        : 'Auto · phone at <b>1.00×</b> — PC crop <b>'+s.z.toFixed(2)+'×</b> of <b>'
-          +s.zmax.toFixed(2)+'×</b> max. The phone takes over only when the PC crop runs out.';
+        ? (s.auto
+            ? 'Auto · phone at <b>'+s.sz_obs.toFixed(2)+'×</b> — the PC crop was pinned and you were still small in frame.'
+            : 'Auto · phone held at <b>'+s.sz_obs.toFixed(2)+'×</b>. Auto-frame is off, so it only hands back — zoom out to release it.')
+        : (s.auto
+            ? 'Auto · phone at <b>1.00×</b> — PC crop <b>'+s.z.toFixed(2)+'×</b> of <b>'
+              +s.zmax.toFixed(2)+'×</b> max. The phone takes over only when the PC crop runs out.'
+            : 'Auto · phone at <b>1.00×</b>. It zooms in only while Auto-frame is tracking.');
       if(Math.abs(s.sz_req-s.sz_obs)>0.05)
         t+=' <span style="color:var(--warn)">→ '+s.sz_req.toFixed(2)+'× landing</span>';
       $('szline').innerHTML=t;
@@ -551,7 +580,13 @@ async function poll(){
    The window then renders perfectly with not one handler attached, which is precisely the "buttons
    do nothing" failure. So: keep retrying for 30 s, and SAY SO if the bridge never turns up. */
 (function(){
-  function tryBoot(){ if(window.pywebview && window.pywebview.api){ boot(); return true; } return false; }
+  /* Ready means POPULATED, not present: pywebview creates window.pywebview.api as an empty object
+     first (api.js), crawls the Python side, and only then fills it in one go (finish.js). Booting on
+     the empty object threw "api.options is not a function" and, booted already, never retried —
+     MEASURED 2026-10-05, whenever startup was busy (auto-start waking the phone). */
+  function tryBoot(){ if(window.pywebview && window.pywebview.api
+                         && typeof window.pywebview.api.options==='function'){ boot(); return true; }
+                      return false; }
   window.addEventListener('pywebviewready', tryBoot);
   if(tryBoot()) return;
   let tries=0;
@@ -586,6 +621,21 @@ class Api:
         self.pipe.set_sensor_zoom(self.cfg.get("sensor_zoom", "off"),
                                   self.cfg.get("sensor_zoom_x", 1.0))
         self.running = False
+        # Auto-start (op3t_webcam.VcamHost / AutoCam). Built here, STARTED by run(): an Api must stay
+        # inert, because test_webui constructs one with no camera, no window and a minimal ctx.
+        self.autocam = ctx["AutoCam"]() if "AutoCam" in ctx else None
+        if self.autocam is not None:
+            self.autocam.enabled = bool(self.cfg.get("autocam", True))
+        self.vcam = None
+        self.cam_users = 0
+        self.tray = None
+        self._win = None
+        self._quitting = False
+        self._quit = threading.Event()
+        try:
+            self._autostart = bool(ctx.get("get_autostart", lambda: "")())
+        except Exception:
+            self._autostart = False
 
     def options(self):
         c = self.ctx
@@ -595,7 +645,7 @@ class Api:
                 "bitrates": [{"value": v, "label": lbl} for v, lbl in
                              ((8, "8 Mbps — lighter"), (12, "12 Mbps — default"),
                               (16, "16 Mbps"), (20, "20 Mbps — sharpest"))],
-                "preview_url": self.preview_url, "config": self.cfg}
+                "preview_url": self.preview_url, "config": self.cfg, "autostart": self._autostart}
 
     def _args(self, cfg):
         w, h = map(int, cfg["resolution"].split("x"))
@@ -624,6 +674,12 @@ class Api:
             self.pipe.zoom, self.pipe.pan = z2, [cx2, cy2]   # hand the framing back, no jump
 
     def start(self, cfg):
+        """Start (button or tray): a stream the user owns, so auto-start never stops it."""
+        if self.autocam is not None:
+            self.autocam.user_start()
+        self._begin(cfg)
+
+    def _begin(self, cfg):
         self.save(cfg)
         self.pipe.zoom = float(cfg["zoom"])
         self.pipe.ev = int(cfg["ev"])
@@ -637,8 +693,115 @@ class Api:
             self.pipe.start(*self._args(cfg))
 
     def stop(self):
+        """Stop (button or tray). Respected even while an app still has the camera on: auto-start
+        then waits for that app to let go before it will start the stream again."""
+        if self.autocam is not None:
+            self.autocam.user_stop()
+        self._end()
+
+    def _end(self):
         self.running = False
         self.pipe.stop()
+
+    def set_autocam(self, on):
+        """Start and stop with the apps that use the camera. Off = only Start starts the stream, and
+        the virtual camera exists only while streaming, exactly as before auto-start."""
+        on = bool(on)
+        self.save(dict(self.cfg, autocam=on))
+        if self.autocam is not None:
+            self.autocam.enabled = on
+        if self.vcam is not None:
+            if on:
+                self.vcam.idle(*self._spec())
+            else:
+                self.vcam.no_idle()
+        return on
+
+    def set_autostart(self, on):
+        """Start with Windows, straight into the tray: a per-user Run entry, so no admin prompt."""
+        try:
+            self._autostart = bool(self.ctx["set_autostart"](bool(on)))
+        except Exception as e:
+            self.ctx["log_js_error"](f"set_autostart({on}): {e!r}")
+        return self._autostart
+
+    # ---- background: camera host, auto-start, tray, window (Python-side only, never JS) ----------
+
+    def _spec(self):
+        w, h = map(int, self.cfg["resolution"].split("x"))
+        return w, h, int(self.cfg["fps"])
+
+    def _start_background(self, win):
+        """The parts that need a real camera or window. run() calls this; tests never do."""
+        self._win = win
+        if "VcamHost" not in self.ctx:
+            return
+        if self.cfg.get("autocam", True) and "adb_warm" in self.ctx:
+            # so the first camera-on after launch does not wait 5 s for an adb server to start
+            threading.Thread(target=self.ctx["adb_warm"], daemon=True).start()
+        self.vcam = self.ctx["VcamHost"]()
+        self.pipe.vcam = self.vcam
+        if self.cfg.get("autocam", True):
+            self.vcam.idle(*self._spec())
+        if self.autocam is not None:
+            threading.Thread(target=self._autocam_loop, daemon=True).start()
+
+    def _autocam_loop(self):
+        """Four ticks a second; each is one NtQueryObject on a handle we already hold."""
+        while not self._quit.wait(0.25):
+            try:
+                users = self.vcam.consumers()
+                self.cam_users = users
+                t = self.pipe.thread
+                act = self.autocam.step(users, time.monotonic(), bool(t and t.is_alive()))
+                if act == "start":
+                    self._auto_start()
+                elif act == "stop":
+                    self._auto_stop()
+            except Exception as e:
+                self.ctx["log_js_error"](f"autocam: {e!r}")
+
+    def _auto_start(self):
+        self.ctx["log_js_error"]("autocam: an app turned the camera on -> start")
+        try:
+            self.ctx["adb_forward"](self.port)     # the last auto-stop parked the phone: wake it
+        except Exception:
+            pass
+        self._begin(dict(self.cfg))
+        if self.tray is not None:
+            self.tray.notify("Camera on", "An app turned the camera on. Streaming from your phone.")
+
+    def _auto_stop(self):
+        self.ctx["log_js_error"]("autocam: every app let go of the camera -> stop")
+        self._end()
+        try:
+            self.ctx.get("park_phone", lambda p: None)(self.port)   # sleep it; keep adb up
+        except Exception:
+            pass
+
+    def _show_window(self):
+        """Always opens maximised; from the tray, a second launch, or a failed tray at login."""
+        if self._win is None:
+            return
+        try:
+            self._win.show()
+            self._win.maximize()
+        except Exception as e:
+            self.ctx["log_js_error"](f"show window: {e!r}")
+
+    def _quit_app(self):
+        """Tray > Quit: the only way out now that closing the window hides it."""
+        self._quitting = True
+        if self.tray is not None:
+            self.tray.dispose()
+        if self._win is not None:
+            self._win.destroy()
+
+    def _shutdown(self):
+        self._quit.set()
+        self._end()
+        if self.vcam is not None:
+            self.vcam.close()
 
     def set_tightness(self, slider):
         import op3t_webcam as m
@@ -681,16 +844,17 @@ class Api:
         """ONE poll for the whole UI, 10 Hz. It used to be two (status at 500 ms, preview at 250 ms)
         and the preview one carried a ~324 KB base64 string; the image has its own socket now, so
         this is a couple of hundred bytes and can afford to be quick enough for the crop box."""
-        import time as _t
-
         import op3t_webcam as m
         p = self.pipe
         z, cx, cy = p.auto_view
-        return {"state": p.state, "fps": p.fps, "frames": p.frames, "dropped": p.dropped, "msg": p.msg,
+        msg = p.msg or (self.vcam.error if self.vcam is not None and not self.running else "")
+        return {"state": p.state, "fps": p.fps, "frames": p.frames, "dropped": p.dropped, "msg": msg,
                 "sz_req": round(p.sz.req, 2), "sz_obs": round(p.sz.obs, 2),
                 "auto": p.af.enabled, "z": round(z, 3), "cx": round(cx, 4), "cy": round(cy, 4),
                 "zmax": m.AF_ZOOM_MAX,
-                "lost": p.af.enabled and (_t.monotonic() - p.face_seen) > 1.2}
+                "lost": p.af.enabled and (time.monotonic() - p.face_seen) > 1.2,
+                "running": self.running, "cam_users": self.cam_users,
+                "autocam": bool(self.cfg.get("autocam", True)), "autostart": self._autostart}
 
     def preview(self, on):
         self.pipe.preview_on = bool(on)
@@ -714,13 +878,194 @@ class Api:
         self.pipe.set_zoom(z, float(cx), float(cy))
 
 
+class Tray:
+    """Notification-area icon, made with pythonnet on the window's own WinForms thread — the runtime
+    pywebview already loads, so it adds no dependency (pystray, the usual pick, is LGPL-3.0).
+
+    Left-click opens the window; the menu holds the session, the two startup switches and Quit.
+    Closing the window only hides it here: the app has to keep running to notice an app turning the
+    camera on. Windows logging off still closes it for real."""
+
+    COLORS = {"streaming": (74, 222, 128), "connecting": (110, 168, 254), "error": (244, 88, 122)}
+    IDLE = (152, 160, 184)
+    # pywebview builds the JS bridge by recursing into every public attribute of the js_api object.
+    # Api.tray is one, and crawling the live WinForms form under it stalled the bridge: the panel booted
+    # with "api.options is not a function" (MEASURED 2026-10-04). This is pywebview's own opt-out.
+    _serializable = False
+
+    def __init__(self, api, form):
+        self.api, self.form = api, form
+        self.icon = self.timer = None
+        self._icons = {}
+        self._told = False
+
+    def build(self):
+        """Runs on the GUI thread (form.Invoke)."""
+        import clr
+        clr.AddReference("System.Windows.Forms")
+        clr.AddReference("System.Drawing")
+        from System.Drawing import Font, FontStyle
+        from System.Windows.Forms import (ContextMenuStrip, NotifyIcon, Timer, ToolStripMenuItem,
+                                          ToolStripSeparator)
+        api = self.api
+        self.m_open = ToolStripMenuItem("Open OP3T Webcam")
+        self.m_open.Font = Font(self.m_open.Font, FontStyle.Bold)
+        self.m_open.Click += lambda s, e: api._show_window()
+        self.m_go = ToolStripMenuItem("Start camera")
+        self.m_go.Click += lambda s, e: self._toggle()
+        self.m_auto = ToolStripMenuItem("Start when an app turns the camera on")
+        self.m_auto.CheckOnClick = True
+        self.m_auto.Click += lambda s, e: api.set_autocam(self.m_auto.Checked)
+        self.m_boot = ToolStripMenuItem("Start with Windows")
+        self.m_boot.CheckOnClick = True
+        self.m_boot.Click += lambda s, e: api.set_autostart(self.m_boot.Checked)
+        self.m_quit = ToolStripMenuItem("Quit")
+        # off the GUI thread: destroy() marshals back onto it and would wait on itself
+        self.m_quit.Click += lambda s, e: threading.Thread(target=api._quit_app, daemon=True).start()
+        menu = ContextMenuStrip()
+        for item in (self.m_open, self.m_go, ToolStripSeparator(), self.m_auto, self.m_boot,
+                     ToolStripSeparator(), self.m_quit):
+            menu.Items.Add(item)
+        menu.Opening += lambda s, e: self._refresh_menu()
+        self.icon = NotifyIcon()
+        self.icon.ContextMenuStrip = menu
+        self.icon.MouseClick += self._on_click
+        self._tick(None, None)
+        self.icon.Visible = True
+        self.timer = Timer()
+        self.timer.Interval = 1000
+        self.timer.Tick += self._tick
+        self.timer.Start()
+        self.form.FormClosing += self._on_closing
+
+    def notify(self, title, text):
+        """A Windows notification from any thread."""
+        if self.icon is None:
+            return
+        from System import Action
+        from System.Windows.Forms import ToolTipIcon
+
+        def show():
+            if self.icon is not None:
+                self.icon.ShowBalloonTip(4000, title, text, ToolTipIcon.Info)
+        try:
+            self.form.BeginInvoke(Action(show))
+        except Exception:
+            pass
+
+    def dispose(self):
+        """Take the icon down now, or it lingers in the tray until the mouse passes over it."""
+        if self.icon is None:
+            return
+        from System import Action
+
+        def gone():
+            self.timer.Stop()
+            self.icon.Visible = False
+            self.icon.Dispose()
+            self.icon = None
+        try:
+            if self.form.InvokeRequired:
+                self.form.Invoke(Action(gone))
+            else:
+                gone()
+        except Exception:
+            pass
+
+    def _toggle(self):
+        api = self.api
+        go = api.stop if api.running else (lambda: api.start(dict(api.cfg)))
+        threading.Thread(target=go, daemon=True).start()    # stop() joins a thread: not on the GUI
+
+    def _refresh_menu(self):
+        self.m_go.Text = "Stop camera" if self.api.running else "Start camera"
+        self.m_auto.Checked = bool(self.api.cfg.get("autocam", True))
+        self.m_boot.Checked = self.api._autostart
+
+    def _on_click(self, sender, e):
+        from System.Windows.Forms import MouseButtons
+        if e.Button == MouseButtons.Left:
+            self.api._show_window()
+
+    def _on_closing(self, sender, args):
+        from System.Windows.Forms import CloseReason
+        if self.api._quitting or args.CloseReason != CloseReason.UserClosing:
+            return                                   # Quit, or Windows logging off: really close
+        args.Cancel = True
+        sender.Hide()
+        if not self._told:
+            self._told = True
+            self.notify("Still running in the tray",
+                        "OP3T Webcam keeps waiting for apps to turn the camera on. "
+                        "Right-click its icon to quit.")
+
+    def _tick(self, sender, e):
+        p, api = self.api.pipe, self.api
+        if p.state == "streaming":
+            text = f"OP3T Webcam: streaming, {p.fps:.0f} fps"
+        elif p.state == "connecting":
+            text = "OP3T Webcam: connecting to the phone"
+        elif p.state == "error":
+            text = "OP3T Webcam: error, open for details"
+        elif api.cfg.get("autocam", True):
+            text = "OP3T Webcam: waiting for an app"
+        else:
+            text = "OP3T Webcam: stopped"
+        self.icon.Icon = self._icon(p.state)
+        self.icon.Text = text[:63]                   # NotifyIcon throws on anything longer
+
+    def _icon(self, state):
+        """A video-camera glyph in the state's colour, drawn once per state: no icon file to ship."""
+        key = state if state in self.COLORS else "idle"
+        if key in self._icons:
+            return self._icons[key]
+        from System import Array
+        from System.Drawing import Bitmap, Color, Graphics, Icon, Point, SolidBrush
+        from System.Drawing.Drawing2D import SmoothingMode
+        r, g, b = self.COLORS.get(key, self.IDLE)
+        bmp = Bitmap(32, 32)
+        gr = Graphics.FromImage(bmp)
+        gr.SmoothingMode = SmoothingMode.AntiAlias
+        gr.Clear(Color.Transparent)
+        fill = SolidBrush(Color.FromArgb(255, r, g, b))
+        gr.FillRectangle(fill, 1, 8, 21, 16)                                   # body
+        gr.FillPolygon(fill, Array[Point]([Point(22, 13), Point(31, 8), Point(31, 24), Point(22, 19)]))
+        gr.FillEllipse(SolidBrush(Color.FromArgb(255, 7, 8, 13)), 6, 11, 10, 10)   # lens
+        gr.Dispose()
+        self._icons[key] = Icon.FromHandle(bmp.GetHicon())
+        return self._icons[key]
+
+
+def _listen_for_show(api, event):
+    """A second launch signals this event (op3t_webcam._single_instance) instead of starting a copy."""
+    import ctypes
+    from ctypes import wintypes as w
+    k32 = ctypes.WinDLL("kernel32")
+    k32.WaitForSingleObject.restype = w.DWORD
+    k32.WaitForSingleObject.argtypes = [w.HANDLE, w.DWORD]
+    while not api._quit.is_set():
+        if k32.WaitForSingleObject(event, 500) == 0:          # WAIT_OBJECT_0
+            api._show_window()
+
+
 def run(ctx):
     try:
         import webview
     except Exception:
         return False
-    ctx["adb_forward"](ctx["port"])
+    tray_mode = bool(ctx.get("tray"))
+    if getattr(sys, "frozen", False):
+        # A moved exe leaves a login entry pointing at nothing: re-point it at this one.
+        try:
+            if ctx["get_autostart"]() not in ("", ctx["autostart_command"]()):
+                ctx["set_autostart"](True)
+        except Exception:
+            pass
     api = Api(ctx)
+    if not tray_mode and not api.cfg.get("autocam", True):
+        # Wake the phone ahead of a manual Start. With auto-start the phone is woken when an app
+        # turns the camera on instead: waking it here would leave its screen lit for nobody.
+        ctx["adb_forward"](ctx["port"])
     srv = None
     try:
         srv, mport = ctx["start_mjpeg"](api.pipe)
@@ -728,10 +1073,34 @@ def run(ctx):
     except Exception:
         api.preview_url = None          # the JS drops to the bridge poll on an <img> error
         api.pipe.preview_fmt = "ppm"    # ...which needs the numpy path building frames again
-    # Landscape 16:9 to match a laptop screen: controls left / preview right.
+    # Controls left / preview right. Opens maximised; with --tray (Start with Windows) it starts hidden
+    # and only the tray icon shows. 1280x720 is just what Restore Down goes back to.
     win = webview.create_window("OP3T Webcam", html=HTML, js_api=api,
                                 width=1280, height=720, min_size=(900, 560),
-                                resizable=True, background_color="#07080d")
+                                resizable=True, background_color="#07080d",
+                                maximized=True, hidden=tray_mode)
+    api._start_background(win)
+    if ctx.get("show_event"):
+        threading.Thread(target=_listen_for_show, args=(api, ctx["show_event"]), daemon=True).start()
+
+    def after_start():
+        # webview.start's func: its own thread, once the GUI loop is up and the form exists.
+        for _ in range(200):
+            if getattr(win, "native", None) is not None:
+                break
+            time.sleep(0.05)
+        form = getattr(win, "native", None)
+        try:
+            from System import Action
+            tray = Tray(api, form)
+            form.Invoke(Action(tray.build))
+            api.tray = tray
+            ctx["log_js_error"]("tray: ready")
+        except Exception:
+            import traceback
+            ctx["log_js_error"]("tray failed: " + traceback.format_exc()[-1500:])
+            if tray_mode:
+                api._show_window()       # no tray to come back from: never leave it invisible
 
     def on_loaded():
         # One-shot health probe. A panel whose script fails to parse, or whose boot() never fires
@@ -763,7 +1132,8 @@ def run(ctx):
         api.stop()
     win.events.loaded += on_loaded
     win.events.closed += on_closed
-    webview.start()
+    webview.start(after_start)
+    api._shutdown()                     # the auto-start watcher, the stream, the virtual camera
     api.pipe._mjpeg_stop.set()          # release the MJPEG writer loops before shutting the server
     if srv is not None:
         try:

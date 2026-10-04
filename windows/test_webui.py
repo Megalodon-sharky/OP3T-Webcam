@@ -130,6 +130,15 @@ finally:
     srv.shutdown()
 
 
+# ---- 7b. nothing heavy hangs off the Api where pywebview can crawl it ---------------------------
+# pywebview builds the JS bridge by recursing into every public attribute of the js_api object. The
+# tray (a live WinForms form), the camera host and the auto-start brain hang off Api; crawling the form
+# stalled the bridge and the panel booted with "api.options is not a function" (MEASURED 2026-10-04).
+# _serializable = False is pywebview's own opt-out.
+for cls in (m.VcamHost, m.AutoCam, webui.Tray):
+    check(f"{cls.__name__} opts out of pywebview's js_api crawl",
+          getattr(cls, "_serializable", True) is False)
+
 # ---- 8. Api.options() must be callable AND JSON-serialisable -----------------------------------
 # boot() awaits api.options() before it wires a single handler. If that call raises, or returns
 # something pywebview cannot serialise, the promise never settles: boot hangs forever, every control
