@@ -63,6 +63,15 @@ def tool_path(name):
 
 FFMPEG = tool_path("ffmpeg.exe")
 ADB = tool_path("adb.exe")
+# MEASURED 2026-10-04: an adb server started without this binds UDP :::5353 for mDNS discovery
+# (wireless debugging), and Windows Firewall asks about any program that listens beyond loopback. The
+# exe unpacks adb.exe into a fresh _MEIxxxxx folder on EVERY launch and firewall rules are keyed on the
+# full path, so that "allow adb.exe?" prompt came back on every single launch — the dev box had piled
+# up 182 rules, one per _MEI folder. With ADB_MDNS=0 the server opens nothing but 127.0.0.1:5037. The
+# server inherits it from whichever adb client starts it, so setting it here covers every call;
+# setdefault so an explicit choice still wins. Cost: no wireless-debugging discovery on a server this
+# app started, which it never uses.
+os.environ.setdefault("ADB_MDNS", "0")
 
 # The phone ALWAYS encodes and sends 1080p. Only its CAPTURE size varies, and the phone picks that
 # from the frame rate on its own: 4K sensor readout at 30 fps, 1080p at 60 (the OP3T's H.264 encoder
