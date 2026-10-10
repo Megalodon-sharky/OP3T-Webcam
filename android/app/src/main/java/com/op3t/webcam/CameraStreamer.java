@@ -67,6 +67,15 @@ public class CameraStreamer {
     private GlFlipRenderer glr;                       // camera->GL flip->encoder (null = direct path)
     private Surface captureTarget;                    // what the camera renders into
     private long facePubNs = 0;                       // rate-limit the face publish to ~12 Hz
+    private long depthLogNs = 0;                      // rate-limit the pipeline-depth log to 1 Hz
+    /** Access Unit Delimiter NAL (type 9, primary_pic_type=7): start code + 0x09 + 0xF0.
+     *  Qualcomm's MediaCodec emits no AUDs, so ffmpeg's H.264 parser (h264_find_frame_end) cannot
+     *  close frame N until it reads into frame N+1 — the next slice header with first_mb==0 — which
+     *  only arrives one frame interval later. An AUD also closes a frame, on its 5-byte NAL header.
+     *  It must TRAIL frame N (sent in the same write), not lead frame N+1: a leading AUD arrives in
+     *  the same burst as N+1's slice header, so it would tell the parser nothing earlier. Sent early,
+     *  it is still exactly where the spec wants it — the first NAL of the next access unit. */
+    private static final byte[] AUD = {0, 0, 0, 1, 9, (byte) 0xF0};
     private int capW, capH;                           // capture (sensor readout) size, for the PC mapping
     private volatile String faceMsg;                  // newest face update; a WRITER thread drains this
     private volatile long faceSeq;                    // bumped on each publish so the writer skips repeats
@@ -91,6 +100,14 @@ public class CameraStreamer {
         @Override public void onCaptureCompleted(CameraCaptureSession s, CaptureRequest r,
                                                  TotalCaptureResult result) {
             long now = System.nanoTime();
+            // ACTUAL per-frame camera-stack depth, once a second. pipelineMaxDepth is only the declared
+            // ceiling; the HAL often skips stages, so this turns an upper bound into a measurement.
+            // Each stage costs one frame interval (16.7 ms @60fps), so depth x interval is the
+            // camera-stack share of latency.
+            if (now - depthLogNs > 1_000_000_000L) {
+                depthLogNs = now;
+                Log.i(TAG, "pipelineDepth=" + result.get(CaptureResult.REQUEST_PIPELINE_DEPTH));
+            }
             if (now - facePubNs < FACE_PERIOD_NS) return;
             facePubNs = now;
             Face[] faces = result.get(CaptureResult.STATISTICS_FACES);
@@ -292,8 +309,18 @@ public class CameraStreamer {
                         }
                         buf.position(info.offset);
                         buf.limit(info.offset + info.size);
-                        byte[] data = new byte[info.size];
-                        buf.get(data);
+                        // Append an AUD after every COMPLETE frame, in the same write, so the PC's
+                        // parser can close this frame now instead of one frame interval later.
+                        // Not after CODEC_CONFIG (SPS/PPS precede the first frame; nothing to close),
+                        // and not after a PARTIAL_FRAME buffer — an AUD in the middle of a frame would
+                        // split one picture into two broken access units. One array, so it stays a
+                        // single write+flush (a second write per frame would cost its own syscall).
+                        boolean isConfig = (info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0;
+                        boolean partial = (info.flags & MediaCodec.BUFFER_FLAG_PARTIAL_FRAME) != 0;
+                        int post = (isConfig || partial) ? 0 : AUD.length;
+                        byte[] data = new byte[info.size + post];
+                        buf.get(data, 0, info.size);
+                        if (post > 0) System.arraycopy(AUD, 0, data, info.size, post);
                         try { out.write(data); out.flush(); }
                         catch (Exception e) { running = false; } // PC disconnected -> stop
                     }
@@ -329,6 +356,18 @@ public class CameraStreamer {
         Float mz = cc.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM);
         maxZoom = (mz != null) ? mz : 1f;
         evRange = cc.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE);   // EV-comp steps allowed
+        // VALIDATES the "capture->socket" number below. That delta subtracts presentationTimeUs from
+        // System.nanoTime(), which is only meaningful if the HAL stamps frames on CLOCK_MONOTONIC.
+        // TIMESTAMP_SOURCE_REALTIME (=1) would mean a different timebase and a garbage delta, so log it
+        // once instead of asserting it in a comment. Also log the declared pipeline depth: AOSP defines
+        // "a pipeline depth of X stages = X frame intervals" of latency, so this is the camera-stack
+        // ceiling in frames.
+        Integer tsSrc = cc.get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE);
+        Byte maxDepth = cc.get(CameraCharacteristics.REQUEST_PIPELINE_MAX_DEPTH);   // Key<Byte>, not Integer
+        Log.i(TAG, "timestampSource=" + tsSrc
+                + (tsSrc != null && tsSrc == CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME
+                   ? " (REALTIME - capture->socket delta is INVALID)" : " (0=UNKNOWN/MONOTONIC - delta valid)")
+                + " pipelineMaxDepth=" + maxDepth);
         // Closest focus in diopters (1/metres). 0 means a fixed-focus lens, in which case the manual
         // focus slider has nothing to drive and we stay on autofocus.
         Float mfd = cc.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE);
