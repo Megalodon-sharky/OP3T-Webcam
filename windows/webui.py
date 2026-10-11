@@ -438,7 +438,7 @@ async function bootInner(){
     applyView(); drawSlider(); saveSoon(); });
   window.addEventListener('mousemove',onBoxMove);
   window.addEventListener('mouseup',()=>{ if(bdrag||hdrag){ bdrag=null; hdrag=false; saveSoon(); } });
-  applyView();
+  applyView(false);   /* draw only — NOT a user touch (see applyView) */
   /* ONE poll for the whole UI. It carries no image any more — the preview has its own MJPEG socket
      — so 10 Hz costs a couple of hundred bytes a tick instead of a 324 KB base64 string. */
   setInterval(poll,100);
@@ -482,10 +482,13 @@ function drawBox(){ const b=$('cbox');
   b.classList.add('on');
   const s=100/view.z; b.style.width=s+'%'; b.style.height=s+'%';
   b.style.left=((view.cx-0.5/view.z)*100)+'%'; b.style.top=((view.cy-0.5/view.z)*100)+'%'; }
-function applyView(){ view.z=Math.min(4,Math.max(1,Math.round(view.z*10)/10)); clampView(); drawBox();
+function applyView(user=true){ view.z=Math.min(4,Math.max(1,Math.round(view.z*10)/10)); clampView(); drawBox();
   store.zoom=view.z;
   if(!afOn){ $('z').value=view.z; $('zval').textContent=view.z.toFixed(1)+'×'; }
-  if(!api) return;
+  /* boot passes user=false: it only DRAWS the saved view (Api.__init__ already restored zoom/pan on
+     the Python side). Treating it as a manual touch handed control back and switched face tracking
+     OFF on every launch — and the next save then wrote autoframe:false. */
+  if(!api || !user) return;
   /* Touching a manual control hands control back — but SAY SO instead of silently unchecking. */
   if(afOn){ setAf(false); $('ban').classList.add('on'); drawSlider(); }
   api.set_view(view.z,view.cx,view.cy); }

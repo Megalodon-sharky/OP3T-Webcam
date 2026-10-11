@@ -25,6 +25,16 @@ Usage:
   python windows/latency_probe.py --decoder CPU
   python windows/latency_probe.py --flush-packets          # A/B the ffmpeg output-buffer fix
   python windows/latency_probe.py --socket-only            # phone cadence only, no ffmpeg
+  python windows/latency_probe.py --strip-aud              # no-AUD arm of an A/B on the same phone build
+  python windows/latency_probe.py --torch 5                # phone-side residual via torch round-trip
+
+A/B the trailing-AUD fix: run with and without --strip-aud, back to back, SEVERAL times each.
+decode+pipe is BIMODAL per session — each stream start locks into ~22 ms or ~40 ms (one frame higher)
+and stays there; both QSV and CPU do it; decoded-vs-AU counts are identical in both modes, so it is not
+a pairing slip. Stripped: ~38 ms in 5/5 sessions (2026-10-08). With AUD: ~22 ms in 6/7 (2026-10-08) but
+only ~5/9 (2026-10-10). So the AUD enables the fast mode without guaranteeing it — compare session
+COUNTS, not one run. The report also prints how far each trailing AUD lagged its frame (0.00 ms = it
+travelled with the frame).
 """
 import argparse
 import bisect
@@ -43,6 +53,7 @@ VCL = (NAL_SLICE, NAL_IDR)
 NAL_NAMES = {1: "P", 5: "IDR", 6: "SEI", 7: "SPS", 8: "PPS", 9: "AUD"}
 
 RECV = 4096  # small reads so an arrival timestamp is accurate to ~3 ms at 12 Mbps, not ~45 ms
+AUD_BYTES = b"\x00\x00\x00\x01\x09\xf0"   # exactly what CameraStreamer appends after each frame
 
 
 class ByteClock:
@@ -242,6 +253,9 @@ def main():
                     help="add -f h264 so ffmpeg skips format probing on the pipe")
     ap.add_argument("--socket-only", action="store_true", help="phone cadence only, skip ffmpeg")
     ap.add_argument("--extra", default="", help="extra ffmpeg INPUT args, e.g. \"-surfaces 4\"")
+    ap.add_argument("--strip-aud", action="store_true",
+                    help="remove the phone's trailing AUD NALs before ffmpeg sees them — the "
+                         "no-AUD arm of an A/B on the SAME phone build (arrival times unchanged)")
     ap.add_argument("--torch", type=int, default=0, metavar="N",
                     help="torch round-trip mode: N trials measuring the PHONE-SIDE residual "
                          "(fires FLASH and times the luma step in the decoded frames)")
@@ -304,6 +318,8 @@ def main():
     pending = None         # (payload_start_offset, kind) of the VCL NAL we haven't closed yet
     nal_counts = {}
     t_first = None
+    aud_carry = b""        # --strip-aud: tail of the last chunk that might be the start of an AUD
+    aud_lags = []          # ms between a frame's last byte and its trailing AUD's arrival
 
     deadline = time.perf_counter() + args.seconds
     try:
@@ -322,15 +338,48 @@ def main():
             clock.add(len(data), t)
             stream += data
             if ff:
-                ff.stdin.write(data)
-                ff.stdin.flush()
+                if args.strip_aud:
+                    # Remove AUDs from what ffmpeg sees, but NOT from `stream`, so arrival timing and
+                    # AU boundaries are measured identically in both arms. An AUD can straddle two
+                    # recv chunks, so hold back any tail that could be the start of one. That never
+                    # delays real frame data: Baseline/CAVLC NALs end on a non-zero byte (the rbsp
+                    # stop bit), so a held-back tail is only start-code bytes of the NEXT NAL.
+                    feed = (aud_carry + data).replace(AUD_BYTES, b"")
+                    keep = 0
+                    for k in range(len(AUD_BYTES) - 1, 0, -1):
+                        if feed.endswith(AUD_BYTES[:k]):
+                            keep = k
+                            break
+                    aud_carry = feed[len(feed) - keep:] if keep else b""
+                    feed = feed[:len(feed) - keep] if keep else feed
+                else:
+                    feed = data
+                if feed:
+                    ff.stdin.write(feed)
+                    ff.stdin.flush()
 
             # Scan the freshly-appended region for start codes. Back up 3 bytes so a start code
             # straddling two recv chunks is still seen exactly once.
             start = max(scanned, 0)
             for pos, ntype in find_start_codes(stream, start):
                 nal_counts[ntype] = nal_counts.get(ntype, 0) + 1
-                if ntype in VCL:
+                if ntype == NAL_AUD:
+                    # How long after the frame's last byte did its trailing AUD arrive? ~0 means the
+                    # AUD travels with its frame and the parser CAN close the frame early; ~one frame
+                    # interval means transport split it off and it lands with frame N+1 (no gain).
+                    if pos >= 5:
+                        aud_lags.append((clock.time_of(pos) - clock.time_of(pos - 5)) * 1000)
+                    # An AUD ends the access unit before it. With the phone's TRAILING AUD this closes
+                    # frame N at its real last byte (same write); without this branch the AU would only
+                    # close at frame N+1's slice and swallow the AUD, skewing t_au.
+                    if pending is not None:
+                        prev_start, prev_kind = pending
+                        end_off = pos - 4
+                        au_end_times.append(clock.time_of(end_off))
+                        au_kinds.append(prev_kind)
+                        au_sizes.append(end_off - prev_start)
+                        pending = None
+                elif ntype in VCL:
                     if pending is not None:
                         prev_start, prev_kind = pending
                         end_off = pos - 4          # last byte before this NAL's start code
@@ -385,6 +434,13 @@ def main():
     if NAL_AUD not in nal_counts:
         print("  !! no AUD (access unit delimiter) NALs — the H.264 parser cannot know a frame ended")
         print("     until the NEXT frame's first bytes arrive. That is a full frame of added latency.")
+    if aud_lags:
+        lag_s = sorted(aud_lags)
+        late = sum(1 for x in aud_lags if x > 5.0)
+        print(f"  trailing-AUD arrival lag behind its frame, ms: median {statistics.median(aud_lags):5.2f}"
+              f"  p95 {lag_s[int(len(lag_s)*0.95)]:5.2f}  max {max(aud_lags):6.2f}"
+              f"   late(>5ms): {late}/{len(aud_lags)}"
+              f"{'   [stripped before ffmpeg]' if args.strip_aud else ''}")
     print(f"access units: {len(au_end_times)}  "
           f"({len(au_end_times)/dur:.1f} fps over {dur:.1f}s)" if dur else
           f"access units: {len(au_end_times)}")

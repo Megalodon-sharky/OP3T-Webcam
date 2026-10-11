@@ -1,6 +1,8 @@
 package com.op3t.webcam;
 
 import android.Manifest;
+import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.os.Bundle;
@@ -48,6 +50,18 @@ public class MainActivity extends AppCompatActivity {
     private static final long DIM_AFTER_MS = 30_000;
     private static final float BRIGHT_DIM = 0.01f;   // near-off; with black pixels OLED ~idle
 
+    // Sleep when the PC goes away. The PC's own park_phone() (adb KEYCODE_SLEEP) only runs when its
+    // app stops cleanly — a PC that shuts down, sleeps, crashes or loses the cable never sends it, and
+    // the screen used to stay on at full brightness forever. So the phone decides for itself:
+    //   USB host gone for HOST_GONE_CHECKS seconds -> the PC is off/asleep/unplugged: sleep now.
+    //   USB still there                         -> PC alive, stream just stopped/restarting: wait
+    //                                              SLEEP_GRACE_MS for a reconnect first.
+    // "Sleep" = drop FLAG_KEEP_SCREEN_ON and go dark; the system then turns the screen off on its own
+    // timeout (immediately if nobody has touched the phone for that long). The next Start still works:
+    // the PC wakes + relaunches a phone that doesn't answer (Pipeline._run -> adb_forward).
+    private static final long SLEEP_GRACE_MS = 15_000;
+    private static final int HOST_GONE_CHECKS = 3;   // 1 Hz checks: rides out a USB/adb flap
+
     private TextView status;
     private ServerSocket server;
     private volatile CameraStreamer streamer;   // volatile: the face writer thread reads it
@@ -58,12 +72,17 @@ public class MainActivity extends AppCompatActivity {
 
     private final Handler ui = new Handler(Looper.getMainLooper());
     private final Runnable dimTask = this::dimScreen;
+    private final Runnable sleepCheck = this::checkSleep;
     private boolean dimmed = false;
     private volatile boolean streaming = false;
+    private long disconnectedAt;     // uptime ms of the last PC disconnect (UI thread only)
+    private int hostGoneChecks;      // consecutive 1 Hz checks that found no USB host
 
     @Override protected void onCreate(Bundle b) {
         super.onCreate(b);
-        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        // NOT FLAG_KEEP_SCREEN_ON here any more: it is held only while a PC session is live (+ the
+        // reconnect grace). Waiting with no PC, the phone times out like any app — the PC wakes and
+        // relaunches it when it actually needs the camera.
         status = new TextView(this);
         status.setTextSize(18);
         status.setTextColor(Color.WHITE);
@@ -177,7 +196,14 @@ public class MainActivity extends AppCompatActivity {
             int[] cfg = parseConfig(line);
             if (cfg != null) { w = cfg[0]; h = cfg[1]; fps = cfg[2]; }
             final int fw = w, fh = h, ff = fps;
-            runOnUiThread(() -> { setStatus("PC connected. Streaming " + fw + "x" + fh + " @" + ff); armDim(); });
+            runOnUiThread(() -> {
+                ui.removeCallbacks(sleepCheck);          // a PC is back: cancel any pending sleep
+                // Streaming needs the screen on: Android 9 takes the camera away from a stopped
+                // activity, and a timed-out screen locks and stops it.
+                getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                setStatus("PC connected. Streaming " + fw + "x" + fh + " @" + ff);
+                armDim();
+            });
 
             if (!wakeLock.isHeld()) wakeLock.acquire();
             streaming = true;
@@ -201,8 +227,57 @@ public class MainActivity extends AppCompatActivity {
             if (streamer != null) streamer.stop();
             try { client.close(); } catch (Exception ignored) {}
             if (wakeLock.isHeld()) wakeLock.release();
-            runOnUiThread(() -> { wakeScreen(); ui.removeCallbacks(dimTask); setStatus("PC disconnected. Waiting on tcp:" + PORT); });
+            // No wakeScreen() here any more — that forced FULL brightness on every disconnect, which is
+            // how a switched-off PC left the phone lit forever. Stay as dark as we were, and start the
+            // sleep checks.
+            runOnUiThread(() -> {
+                ui.removeCallbacks(dimTask);
+                setStatus("PC disconnected. Waiting on tcp:" + PORT);
+                disconnectedAt = android.os.SystemClock.uptimeMillis();
+                hostGoneChecks = 0;
+                ui.removeCallbacks(sleepCheck);
+                ui.postDelayed(sleepCheck, 1000);
+            });
         }
+    }
+
+    /** Is a USB host (the PC) on the other end of the cable? From the sticky USB_STATE broadcast, so
+     *  nothing has to be registered. "connected" goes false when the PC powers the port down;
+     *  "configured" goes false when it's off/asleep but the port still supplies power. Unknown ->
+     *  assume present, which only means the slower grace path. */
+    private boolean usbHostPresent() {
+        try {
+            Intent i = registerReceiver(null, new IntentFilter("android.hardware.usb.action.USB_STATE"));
+            if (i == null) return true;
+            return i.getBooleanExtra("connected", true) && i.getBooleanExtra("configured", true);
+        } catch (Exception e) {
+            return true;
+        }
+    }
+
+    /** 1 Hz after a disconnect, until a PC reconnects or we sleep. UI thread. */
+    private void checkSleep() {
+        if (streaming) return;
+        hostGoneChecks = usbHostPresent() ? 0 : hostGoneChecks + 1;
+        long since = android.os.SystemClock.uptimeMillis() - disconnectedAt;
+        if (hostGoneChecks >= HOST_GONE_CHECKS) {
+            letScreenSleep("PC switched off or unplugged");
+        } else if (since >= SLEEP_GRACE_MS) {
+            letScreenSleep("PC stopped streaming");
+        } else {
+            ui.postDelayed(sleepCheck, 1000);
+        }
+    }
+
+    private void letScreenSleep(String why) {
+        Log.i(TAG, "sleep: " + why);
+        getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        dimmed = true;
+        WindowManager.LayoutParams lp = getWindow().getAttributes();
+        lp.screenBrightness = BRIGHT_DIM;
+        getWindow().setAttributes(lp);
+        status.setTextColor(Color.rgb(20, 20, 20));
+        status.setText("OP3T Webcam\n\n" + why + " — letting the phone sleep.\n\ntap to wake");
     }
 
     /** Reads one '\n'-terminated line (max 64 bytes) without buffering past it. null = EOF (PC closed). */
@@ -295,6 +370,7 @@ public class MainActivity extends AppCompatActivity {
         super.onDestroy();
         streaming = false;
         ui.removeCallbacks(dimTask);
+        ui.removeCallbacks(sleepCheck);
         if (streamer != null) streamer.stop();
         try { if (server != null) server.close(); } catch (Exception ignored) {}
         try { if (faceServer != null) faceServer.close(); } catch (Exception ignored) {}
