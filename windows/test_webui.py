@@ -179,6 +179,90 @@ if _api is not None:
                   "bitrate", "focus", "pan"):
             check(f"options().config provides '{k}'", k in o.get("config", {}))
 
+# ---- 9. saved face tracking survives boot (regression 2026-10-10) -------------------------------
+# The only check here that RUNS the UI's JavaScript. boot() restored a saved autoframe:true, then
+# called applyView() just to draw the crop box — and applyView() treated that as a manual touch:
+# it switched tracking off, sent set_view (Pipeline.set_zoom disengages auto-framing) and the next
+# save wrote autoframe:false. Static checks can't see call ORDER, so this executes the real script
+# under node with a fake DOM and a recording fake api. Needs node on PATH, else SKIP.
+_BOOT_HARNESS = r"""
+const fs = require('fs'), vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const calls = [];
+function el(id) {
+  const s = new Set();
+  return { id, style: {}, dataset: {}, value: '', checked: false, textContent: '', innerHTML: '',
+    classList: { add: c => s.add(c), remove: c => s.delete(c), contains: c => s.has(c),
+                 toggle: (c, f) => ((f === undefined ? !s.has(c) : f) ? s.add(c) : s.delete(c)) },
+    addEventListener() {}, removeEventListener() {}, appendChild() {}, removeAttribute() {},
+    setAttribute() {}, focus() {}, click() {}, querySelectorAll: () => [], querySelector: () => null,
+    getBoundingClientRect: () => ({ width: 400, height: 225, left: 0, top: 0 }) };
+}
+const els = {};
+const document = { getElementById: id => els[id] || (els[id] = el(id)), createElement: t => el(t),
+  querySelectorAll: () => [], querySelector: () => null, addEventListener() {}, body: el('body') };
+const cfg = JSON.parse(process.argv[3]);
+const reports = [];
+const api = new Proxy({}, { get(t, p) {
+  if (p === 'then') return undefined;
+  return (...a) => {
+    calls.push(String(p));
+    if (p === 'report_js_error') reports.push(String(a[0]));
+    if (p === 'options') return Promise.resolve({ config: cfg, resolutions: ['1920x1080'],
+      fps: ['60', '30'], rotations: ['0', '90', '180', '270'], decoders: ['CPU'], bitrates: [12],
+      autostart: false, preview_url: null });
+    if (p === 'status') return Promise.resolve({ state: 'idle', fps: 0, frames: 0, dropped: 0,
+      msg: '', auto: true, z: cfg.zoom, cx: cfg.pan[0], cy: cfg.pan[1], lost: false, sz_obs: 1 });
+    return Promise.resolve(undefined);
+  };
+} });
+const ctx = { document, console, navigator: { userAgent: 'node' },
+  setInterval: () => 0, clearInterval() {}, setTimeout: () => 0, clearTimeout() {},
+  requestAnimationFrame: () => 0 };
+ctx.window = Object.assign(ctx, { pywebview: { api }, addEventListener() {},
+  removeEventListener() {}, innerWidth: 1200, innerHeight: 800, devicePixelRatio: 1, location: {} });
+vm.createContext(ctx);
+vm.runInContext(src, ctx);
+(async () => {
+  for (let i = 0; i < 50; i++) await new Promise(r => setImmediate(r));
+  const boot = calls.slice();
+  const st = vm.runInContext('({afOn: afOn, snapAf: snap().autoframe})', ctx);
+  vm.runInContext('pvWheel({preventDefault(){}, deltaY: -1})', ctx);
+  const after = vm.runInContext('({afOn: afOn})', ctx);
+  console.log(JSON.stringify({ reports, boot, afOn: st.afOn, snapAf: st.snapAf,
+    wheelAfOn: after.afOn, wheelSetView: calls.slice(boot.length).includes('set_view') }));
+})().catch(e => console.log(JSON.stringify({ error: String(e && e.stack || e) })));
+"""
+import json as _json
+import os as _os
+import shutil as _shutil
+import subprocess as _sp
+import tempfile as _tf
+
+_node = _shutil.which("node")
+if not _node:
+    print("SKIP  saved face tracking survives boot  (node not on PATH)")
+else:
+    _script = re.findall(r"<script[^>]*>(.*?)</script>", webui.HTML, re.S)[-1]
+    _cfg = dict(m.DEFAULTS, autoframe=True, zoom=1.6, pan=[0.4, 0.45])
+    with _tf.TemporaryDirectory() as _d:
+        _ui, _h = _os.path.join(_d, "ui.js"), _os.path.join(_d, "harness.js")
+        open(_ui, "w", encoding="utf-8").write(_script)
+        open(_h, "w", encoding="utf-8").write(_BOOT_HARNESS)
+        _p = _sp.run([_node, _h, _ui, _json.dumps(_cfg)], capture_output=True, text=True, timeout=60)
+    try:
+        _r = _json.loads((_p.stdout or "").strip().splitlines()[-1])
+    except Exception:
+        _r = {"error": (_p.stdout + _p.stderr)[-400:]}
+    check("boot runs under the harness", "error" not in _r and "boot ok" in _r.get("reports", []),
+          str(_r.get("error") or _r.get("reports")))
+    check("boot does not send set_view (a manual-touch hand-back)", "set_view" not in _r.get("boot", []),
+          f"boot calls={_r.get('boot')}")
+    check("saved face tracking is still ON after boot", _r.get("afOn") is True)
+    check("the config boot would save keeps autoframe:true", _r.get("snapAf") is True)
+    check("a real scroll on the preview still hands control back",
+          _r.get("wheelAfOn") is False and _r.get("wheelSetView") is True)
+
 print()
 if fails:
     print(f"{len(fails)} FAILED: {', '.join(fails)}")
